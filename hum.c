@@ -73,6 +73,17 @@ static int pladd_ret;
 /* rename state */
 static int plrename_idx;
 
+/* status flash message */
+static char status_msg[128];
+static int status_ticks; /* counts down each 200ms tick */
+
+static void
+status_set(const char *msg)
+{
+	snprintf(status_msg, sizeof(status_msg), "%s", msg);
+	status_ticks = 10; /* 2 seconds */
+}
+
 /* confirm state */
 static char confirm_msg[256];
 static int confirm_ret;
@@ -533,9 +544,9 @@ queue_clear(void)
 	qscroll = 0;
 }
 
-static void do_pl_delete(void) { pl_delete(confirm_arg); }
-static void do_lib_delete(void) { lib_delete(confirm_arg); }
-static void do_queue_clear(void) { queue_clear(); }
+static void do_pl_delete(void) { pl_delete(confirm_arg); status_set("playlist deleted"); }
+static void do_lib_delete(void) { lib_delete(confirm_arg); status_set("track deleted"); }
+static void do_queue_clear(void) { queue_clear(); status_set("queue cleared"); }
 
 static void
 queue_move(int from, int to)
@@ -593,6 +604,10 @@ play_next(void)
 	} else if (repeat_mode == REP_ALL && nqueue > 0) {
 		qpos = 0;
 		mpv_play(queue[qpos].url, queue[qpos].title);
+	} else {
+		nowplaying[0] = '\0';
+		cur_pos = cur_dur = 0;
+		paused = 0;
 	}
 }
 
@@ -727,6 +742,7 @@ draw(void)
 		mvprintw(y++, 0, "   x            stop playback");
 		mvprintw(y++, 0, "   ,  .         seek back/forward 5s");
 		mvprintw(y++, 0, "   +  -         volume up/down");
+		mvprintw(y++, 0, "   m            mute/unmute");
 		mvprintw(y++, 0, "   r            cycle repeat (off/one/all)");
 		y++;
 		attron(A_BOLD | COLOR_PAIR(C_HEADER));
@@ -939,6 +955,12 @@ draw(void)
 			mvprintw(rows - 3, 0, " %s", rep);
 			attroff(COLOR_PAIR(C_MODE));
 		}
+		if (status_ticks > 0 && status_msg[0]) {
+			attron(COLOR_PAIR(C_PLAYING));
+			mvprintw(rows - 3, cols - (int)strlen(status_msg) - 2,
+			    " %s ", status_msg);
+			attroff(COLOR_PAIR(C_PLAYING));
+		}
 	}
 
 	/* now playing + progress bar */
@@ -1032,9 +1054,30 @@ handle_text_input(int ch, char *buf, int *len, int maxlen)
 /* ---- main ---- */
 
 int
-main(void)
+main(int argc, char *argv[])
 {
 	int ch;
+
+	if (argc > 1 && (strcmp(argv[1], "--help") == 0 ||
+	    strcmp(argv[1], "-h") == 0)) {
+		printf("hum - a minimal TUI music player\n\n");
+		printf("usage: hum [--help]\n\n");
+		printf("keys:\n");
+		printf("  j/k         move down/up\n");
+		printf("  l/Enter     play selected\n");
+		printf("  Space       pause/resume\n");
+		printf("  n/p         next/previous track\n");
+		printf("  Esc /       search YouTube\n");
+		printf("  Esc p       open playlists\n");
+		printf("  v           view queue\n");
+		printf("  b           browse library\n");
+		printf("  a           add to queue\n");
+		printf("  ?           help (in app)\n");
+		printf("  q           quit\n\n");
+		printf("config: edit config.h and rebuild\n");
+		printf("library: %s\n", lib_dir);
+		return 0;
+	}
 
 	resolve_libpath();
 	ensure_dir(libpath);
@@ -1087,6 +1130,7 @@ main(void)
 			}
 			waitpid(-1, NULL, WNOHANG);
 			mpv_get_progress();
+			if (status_ticks > 0) status_ticks--;
 			draw();
 			continue;
 		}
@@ -1113,6 +1157,7 @@ main(void)
 			int r = handle_text_input(ch, input_buf, &input_len, 128);
 			if (r == 1 && input_len > 0) {
 				pl_save(input_buf);
+				status_set("playlist saved");
 				mode = MODE_QUEUE;
 			} else if (r == -1) {
 				mode = MODE_QUEUE;
@@ -1125,6 +1170,7 @@ main(void)
 			int r = handle_text_input(ch, input_buf, &input_len, 128);
 			if (r == 1 && input_len > 0) {
 				pl_rename(plrename_idx, input_buf);
+				status_set("playlist renamed");
 				mode = MODE_PLAYLIST;
 			} else if (r == -1) {
 				mode = MODE_PLAYLIST;
@@ -1161,6 +1207,7 @@ main(void)
 			} else if (ch == '\n' || ch == KEY_ENTER || ch == 'l') {
 				if (sel >= 0 && sel < nplaylists) {
 					pl_append_tracks(sel, pladd_tracks, npladd);
+					status_set("added to playlist");
 					mode = pladd_ret;
 					visual = 0;
 				}
@@ -1232,6 +1279,11 @@ main(void)
 		}
 		if (ch == key_repeat) {
 			repeat_mode = (repeat_mode + 1) % 3;
+			draw();
+			continue;
+		}
+		if (ch == 'm') {
+			mpv_cmd("{\"command\":[\"cycle\",\"mute\"]}");
 			draw();
 			continue;
 		}
@@ -1366,9 +1418,11 @@ main(void)
 						int lo = vsel_min(), hi = vsel_max(), j;
 						for (j = lo; j <= hi && j < npl_tracks; j++)
 							queue_add(&pl_tracks[j]);
+						status_set("added to queue");
 						visual = 0;
 					} else if (sel >= 0 && sel < npl_tracks) {
 						queue_add(&pl_tracks[sel]);
+						status_set("added to queue");
 					}
 				}
 			} else if (ch == key_del) {
@@ -1444,6 +1498,7 @@ main(void)
 				}
 			} else if (ch == key_shuffle) {
 				queue_shuffle();
+				status_set("queue shuffled");
 				visual = 0;
 			} else if (ch == key_plsave) {
 				if (nqueue > 0) {
@@ -1484,9 +1539,11 @@ main(void)
 					int lo = vsel_min(), hi = vsel_max(), j;
 					for (j = lo; j <= hi && j < nlib; j++)
 						queue_add(&library[j]);
+					status_set("added to queue");
 					visual = 0;
 				} else if (sel >= 0 && sel < nlib) {
 					queue_add(&library[sel]);
+					status_set("added to queue");
 				}
 			} else if (ch == key_del) {
 				if (sel >= 0 && sel < nlib) {
@@ -1533,9 +1590,11 @@ main(void)
 					int lo = vsel_min(), hi = vsel_max(), j;
 					for (j = lo; j <= hi && j < nresults; j++)
 						queue_add(&results[j]);
+					status_set("added to queue");
 					visual = 0;
 				} else if (sel >= 0 && sel < nresults) {
 					queue_add(&results[sel]);
+					status_set("added to queue");
 				}
 			} else if (ch == key_addtopl) {
 				if (nplaylists > 0 && nresults > 0) {
