@@ -19,7 +19,7 @@
 #define MAX_URL      768
 #define MAX_QUERY    256
 #define MAX_LIB      1000
-#define SOCK_PATH    "/tmp/hum-mpv.sock"
+static char sock_path[128];
 
 typedef struct {
 	char title[MAX_TITLE];
@@ -69,6 +69,7 @@ static int vsel_start;
 static Track pladd_tracks[500];
 static int npladd;
 static int pladd_ret;
+static int pladd_scroll;
 
 /* rename state */
 static int plrename_idx;
@@ -156,6 +157,9 @@ lib_scan(void)
 		nlib++;
 	}
 	closedir(d);
+	/* sort alphabetically */
+	qsort(library, nlib, sizeof(Track),
+	    (int (*)(const void *, const void *))strcmp);
 }
 
 static int
@@ -340,7 +344,7 @@ mpv_connect(void)
 	if (fd < 0)
 		return -1;
 	addr.sun_family = AF_UNIX;
-	strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
+	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
 	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 		close(fd);
 		return -1;
@@ -409,7 +413,7 @@ mpv_stop(void)
 		waitpid(mpv_pid, NULL, 0);
 		mpv_pid = -1;
 	}
-	unlink(SOCK_PATH);
+	unlink(sock_path);
 }
 
 static void
@@ -421,8 +425,11 @@ mpv_play(const char *url, const char *title)
 		close(STDIN_FILENO);
 		close(STDOUT_FILENO);
 		close(STDERR_FILENO);
+		char ipc_arg[256];
+		snprintf(ipc_arg, sizeof(ipc_arg),
+		    "--input-ipc-server=%s", sock_path);
 		execlp("mpv", "mpv", "--no-video", "--really-quiet",
-		    "--input-ipc-server=" SOCK_PATH, url, NULL);
+		    ipc_arg, url, NULL);
 		_exit(1);
 	}
 	snprintf(nowplaying, sizeof(nowplaying), "%s", title);
@@ -570,7 +577,6 @@ queue_shuffle(void)
 
 	if (nqueue < 2)
 		return;
-	srand(time(NULL));
 	for (i = nqueue - 1; i > 0; i--) {
 		j = rand() % (i + 1);
 		tmp = queue[i];
@@ -865,15 +871,16 @@ draw(void)
 		attron(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(0, 0, " add to playlist:");
 		attroff(A_BOLD | COLOR_PAIR(C_HEADER));
-		for (i = 0; i < visible && i < nplaylists; i++) {
+		for (i = 0; i < visible && i + pladd_scroll < nplaylists; i++) {
+			int idx = i + pladd_scroll;
 			mvprintw(i + 2, 0, " ");
 			attron(COLOR_PAIR(C_NUM));
-			printw("%2d", i + 1);
+			printw("%2d", idx + 1);
 			attroff(COLOR_PAIR(C_NUM));
 			printw("  ");
-			if (i == sel) attron(A_REVERSE);
-			printw("%.*s", cols - 6, plnames[i]);
-			if (i == sel) attroff(A_REVERSE);
+			if (idx == sel) attron(A_REVERSE);
+			printw("%.*s", cols - 6, plnames[idx]);
+			if (idx == sel) attroff(A_REVERSE);
 		}
 		if (nplaylists == 0)
 			mvprintw(2, 0, " no playlists");
@@ -1029,6 +1036,7 @@ cur_scroll(void)
 	if (mode == MODE_LIBRARY) return &libscroll;
 	if (mode == MODE_PLAYLIST) return &plscroll;
 	if (mode == MODE_BROWSE) return &rscroll;
+	if (mode == MODE_PLADD) return &pladd_scroll;
 	return NULL;
 }
 
@@ -1079,6 +1087,9 @@ main(int argc, char *argv[])
 		return 0;
 	}
 
+	srand(time(NULL));
+	snprintf(sock_path, sizeof(sock_path),
+	    "/tmp/hum-mpv-%d.sock", getpid());
 	resolve_libpath();
 	ensure_dir(libpath);
 	resolve_plspath();
@@ -1202,8 +1213,10 @@ main(int argc, char *argv[])
 		if (mode == MODE_PLADD) {
 			if (ch == key_up || ch == KEY_UP) {
 				if (sel > 0) sel--;
+				scroll_into_view(&pladd_scroll);
 			} else if (ch == key_down || ch == KEY_DOWN) {
 				if (sel < nplaylists - 1) sel++;
+				scroll_into_view(&pladd_scroll);
 			} else if (ch == '\n' || ch == KEY_ENTER || ch == 'l') {
 				if (sel >= 0 && sel < nplaylists) {
 					pl_append_tracks(sel, pladd_tracks, npladd);
@@ -1522,6 +1535,7 @@ main(int argc, char *argv[])
 						pladd_ret = MODE_QUEUE;
 						mode = MODE_PLADD;
 						sel = 0;
+						pladd_scroll = 0;
 					}
 				}
 			} else if (ch == key_quit || ch == 27) {
@@ -1570,6 +1584,7 @@ main(int argc, char *argv[])
 						pladd_ret = MODE_LIBRARY;
 						mode = MODE_PLADD;
 						sel = 0;
+						pladd_scroll = 0;
 					}
 				}
 			} else if (ch == key_quit || ch == 27) {
@@ -1612,6 +1627,7 @@ main(int argc, char *argv[])
 						pladd_ret = MODE_BROWSE;
 						mode = MODE_PLADD;
 						sel = 0;
+						pladd_scroll = 0;
 					}
 				}
 			} else if (ch == key_qview) {
