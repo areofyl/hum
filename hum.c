@@ -49,7 +49,7 @@ static char nowplaying[MAX_TITLE];
 static char libpath[512];
 static int qscroll, libscroll, rscroll;
 static double cur_pos, cur_dur;
-static char plspath[512];
+static char plspath[1024];
 static char plnames[50][128];
 static int nplaylists;
 static Track pl_tracks[500];
@@ -138,8 +138,7 @@ lib_scan(void)
 		    strcmp(ext, ".flac") && strcmp(ext, ".wav") &&
 		    strcmp(ext, ".webm"))
 			continue;
-		strncpy(library[nlib].title, e->d_name, MAX_TITLE - 1);
-		library[nlib].title[MAX_TITLE - 1] = '\0';
+		snprintf(library[nlib].title, MAX_TITLE, "%s", e->d_name);
 		char *dot = strrchr(library[nlib].title, '.');
 		if (dot) *dot = '\0';
 		snprintf(library[nlib].url, MAX_URL, "%s/%s", libpath, e->d_name);
@@ -189,8 +188,7 @@ pl_scan(void)
 		ext = strrchr(e->d_name, '.');
 		if (!ext || strcmp(ext, ".hum"))
 			continue;
-		strncpy(plnames[nplaylists], e->d_name, 127);
-		plnames[nplaylists][127] = '\0';
+		snprintf(plnames[nplaylists], 128, "%s", e->d_name);
 		char *dot = strrchr(plnames[nplaylists], '.');
 		if (dot) *dot = '\0';
 		nplaylists++;
@@ -201,7 +199,7 @@ pl_scan(void)
 static void
 pl_load(int idx)
 {
-	char path[768];
+	char path[2048];
 	FILE *fp;
 	char line[MAX_TITLE + MAX_URL];
 
@@ -217,10 +215,8 @@ pl_load(int idx)
 		*tab = '\0';
 		tab++;
 		tab[strcspn(tab, "\n")] = '\0';
-		strncpy(pl_tracks[npl_tracks].title, line, MAX_TITLE - 1);
-		pl_tracks[npl_tracks].title[MAX_TITLE - 1] = '\0';
-		strncpy(pl_tracks[npl_tracks].url, tab, MAX_URL - 1);
-		pl_tracks[npl_tracks].url[MAX_URL - 1] = '\0';
+		snprintf(pl_tracks[npl_tracks].title, MAX_TITLE, "%s", line);
+		snprintf(pl_tracks[npl_tracks].url, MAX_URL, "%s", tab);
 		npl_tracks++;
 	}
 	fclose(fp);
@@ -230,7 +226,7 @@ pl_load(int idx)
 static void
 pl_write(int idx)
 {
-	char path[768];
+	char path[2048];
 	FILE *fp;
 	int i;
 
@@ -246,7 +242,7 @@ pl_write(int idx)
 static void
 pl_save(const char *name)
 {
-	char path[768];
+	char path[2048];
 	FILE *fp;
 	int i;
 
@@ -264,7 +260,7 @@ pl_save(const char *name)
 static void
 pl_delete(int idx)
 {
-	char path[768];
+	char path[2048];
 
 	if (idx < 0 || idx >= nplaylists)
 		return;
@@ -278,7 +274,7 @@ pl_delete(int idx)
 static void
 pl_rename(int idx, const char *newname)
 {
-	char oldpath[768], newpath[768];
+	char oldpath[2048], newpath[2048];
 
 	if (idx < 0 || idx >= nplaylists)
 		return;
@@ -306,7 +302,7 @@ pl_del_track(int tidx)
 static void
 pl_append_tracks(int idx, Track *tracks, int n)
 {
-	char path[768];
+	char path[2048];
 	FILE *fp;
 	int i;
 
@@ -347,8 +343,9 @@ mpv_cmd(const char *cmd)
 	int fd = mpv_connect();
 	if (fd < 0)
 		return;
-	write(fd, cmd, strlen(cmd));
-	write(fd, "\n", 1);
+	if (write(fd, cmd, strlen(cmd)) < 0 || write(fd, "\n", 1) < 0) {
+		/* ignore */
+	}
 	close(fd);
 }
 
@@ -365,7 +362,10 @@ mpv_get_prop(const char *prop)
 		return -1;
 	snprintf(cmd, sizeof(cmd),
 	    "{\"command\":[\"get_property\",\"%s\"]}\n", prop);
-	write(fd, cmd, strlen(cmd));
+	if (write(fd, cmd, strlen(cmd)) < 0) {
+		close(fd);
+		return -1;
+	}
 
 	n = read(fd, buf, sizeof(buf) - 1);
 	close(fd);
@@ -414,8 +414,7 @@ mpv_play(const char *url, const char *title)
 		    "--input-ipc-server=" SOCK_PATH, url, NULL);
 		_exit(1);
 	}
-	strncpy(nowplaying, title, sizeof(nowplaying) - 1);
-	nowplaying[sizeof(nowplaying) - 1] = '\0';
+	snprintf(nowplaying, sizeof(nowplaying), "%s", title);
 	paused = 0;
 }
 
@@ -423,7 +422,7 @@ static void
 lib_download(const char *url, const char *title)
 {
 	pid_t pid;
-	char out[768];
+	char out[2048];
 
 	if (lib_has(title))
 		return;
@@ -481,8 +480,7 @@ do_search(const char *q)
 		*tab = '\0';
 		tab++;
 		tab[strcspn(tab, "\n")] = '\0';
-		strncpy(results[nresults].title, line, MAX_TITLE - 1);
-		results[nresults].title[MAX_TITLE - 1] = '\0';
+		snprintf(results[nresults].title, MAX_TITLE, "%s", line);
 		snprintf(results[nresults].url, MAX_URL,
 		    "https://www.youtube.com/watch?v=%s", tab);
 		nresults++;
@@ -1053,15 +1051,15 @@ main(void)
 	if (has_colors()) {
 		start_color();
 		use_default_colors();
-		init_pair(C_HEADER,  COLOR_BLUE,    -1);
-		init_pair(C_NUM,     COLOR_YELLOW,  -1);
-		init_pair(C_PLAYING, COLOR_GREEN,   -1);
-		init_pair(C_VISUAL,  COLOR_WHITE,   COLOR_BLUE);
-		init_pair(C_STATUS,  COLOR_WHITE,   -1);
-		init_pair(C_BAR,     COLOR_GREEN,   -1);
-		init_pair(C_SEARCH,  COLOR_CYAN,    -1);
-		init_pair(C_MODE,    COLOR_YELLOW,  -1);
-		init_pair(C_DIM,     COLOR_BLACK,   -1);  /* bright black = gray */
+		init_pair(C_HEADER,  col_header_fg,  col_header_bg);
+		init_pair(C_NUM,     col_num_fg,     col_num_bg);
+		init_pair(C_PLAYING, col_playing_fg, col_playing_bg);
+		init_pair(C_VISUAL,  col_visual_fg,  col_visual_bg);
+		init_pair(C_STATUS,  col_status_fg,  col_status_bg);
+		init_pair(C_BAR,     col_bar_fg,     col_bar_bg);
+		init_pair(C_SEARCH,  col_search_fg,  col_search_bg);
+		init_pair(C_MODE,    col_mode_fg,    col_mode_bg);
+		init_pair(C_DIM,     col_dim_fg,     col_dim_bg);
 	}
 
 	atexit(cleanup);
@@ -1396,7 +1394,7 @@ main(void)
 					plrename_idx = sel;
 					input_len = 0;
 					input_buf[0] = '\0';
-					strncpy(input_buf, plnames[sel], 127);
+					snprintf(input_buf, 128, "%s", plnames[sel]);
 					input_len = strlen(input_buf);
 					mode = MODE_PLRENAME;
 				}
