@@ -678,6 +678,17 @@ list_len(void)
 	return nresults;
 }
 
+/* ---- colors (vim default) ---- */
+#define C_HEADER  1
+#define C_NUM     2
+#define C_PLAYING 3
+#define C_VISUAL  4
+#define C_STATUS  5
+#define C_BAR     6
+#define C_SEARCH  7
+#define C_MODE    8
+#define C_DIM     9
+
 /* ---- draw ---- */
 
 static void
@@ -692,13 +703,13 @@ draw(void)
 
 	if (mode == MODE_HELP) {
 		int y = 0;
-		attron(A_BOLD);
+		attron(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(y++, 0, " hum - help");
-		attroff(A_BOLD);
+		attroff(A_BOLD | COLOR_PAIR(C_HEADER));
 		y++;
-		attron(A_BOLD);
+		attron(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(y++, 0, " navigation");
-		attroff(A_BOLD);
+		attroff(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(y++, 0, "   j/k          move down/up");
 		mvprintw(y++, 0, "   g/G          jump to top/bottom");
 		mvprintw(y++, 0, "   Esc /        search youtube");
@@ -708,9 +719,9 @@ draw(void)
 		mvprintw(y++, 0, "   Esc / q      go back");
 		mvprintw(y++, 0, "   ?            this help page");
 		y++;
-		attron(A_BOLD);
+		attron(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(y++, 0, " playback");
-		attroff(A_BOLD);
+		attroff(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(y++, 0, "   l / Enter    play selected");
 		mvprintw(y++, 0, "   Space        pause/resume");
 		mvprintw(y++, 0, "   n            next track");
@@ -720,9 +731,9 @@ draw(void)
 		mvprintw(y++, 0, "   +  -         volume up/down");
 		mvprintw(y++, 0, "   r            cycle repeat (off/one/all)");
 		y++;
-		attron(A_BOLD);
+		attron(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(y++, 0, " queue");
-		attroff(A_BOLD);
+		attroff(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(y++, 0, "   a            add to queue");
 		mvprintw(y++, 0, "   d            delete from queue");
 		mvprintw(y++, 0, "   c            clear queue");
@@ -730,46 +741,50 @@ draw(void)
 		mvprintw(y++, 0, "   S            shuffle queue");
 		mvprintw(y++, 0, "   s            save queue as playlist");
 		y++;
-		attron(A_BOLD);
+		attron(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(y++, 0, " playlists");
-		attroff(A_BOLD);
+		attroff(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(y++, 0, "   l / Enter    enter playlist / play track");
 		mvprintw(y++, 0, "   h            go back one level");
 		mvprintw(y++, 0, "   A            add selected to playlist");
 		mvprintw(y++, 0, "   d            delete playlist / track");
 		mvprintw(y++, 0, "   R            rename playlist");
 		y++;
-		attron(A_BOLD);
+		attron(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(y++, 0, " visual mode");
-		attroff(A_BOLD);
+		attroff(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(y++, 0, "   V            toggle visual selection");
 		mvprintw(y++, 0, "   a/A/d        act on selection");
 
 	} else if (mode == MODE_QUEUE) {
-		attron(A_BOLD);
+		attron(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(0, 0, " queue (%d tracks)", nqueue);
-		attroff(A_BOLD);
+		attroff(A_BOLD | COLOR_PAIR(C_HEADER));
 
 		for (i = 0; i < visible && i + qscroll < nqueue; i++) {
 			int idx = i + qscroll;
 			int playing = (idx == qpos && nowplaying[0]);
 			int selected = (idx == sel || in_vsel(idx));
+			if (playing) attron(COLOR_PAIR(C_PLAYING));
 			mvprintw(i + 2, 0, " %s", idx == qpos ? ">> " : "   ");
-			if (playing) attron(A_REVERSE);
+			if (playing) attroff(COLOR_PAIR(C_PLAYING));
+			attron(COLOR_PAIR(playing ? C_PLAYING : C_NUM));
 			printw("%2d", idx + 1);
-			if (playing) attroff(A_REVERSE);
+			attroff(COLOR_PAIR(playing ? C_PLAYING : C_NUM));
 			printw("  ");
-			if (selected) attron(A_REVERSE);
+			if (selected && visual) attron(COLOR_PAIR(C_VISUAL));
+			else if (selected) attron(A_REVERSE);
 			printw("%.*s", cols - 9, queue[idx].title);
-			if (selected) attroff(A_REVERSE);
+			if (selected && visual) attroff(COLOR_PAIR(C_VISUAL));
+			else if (selected) attroff(A_REVERSE);
 		}
 		if (nqueue == 0)
 			mvprintw(2, 0, " empty");
 
 	} else if (mode == MODE_LIBRARY) {
-		attron(A_BOLD);
+		attron(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(0, 0, " library (%d tracks)", nlib);
-		attroff(A_BOLD);
+		attroff(A_BOLD | COLOR_PAIR(C_HEADER));
 
 		for (i = 0; i < visible && i + libscroll < nlib; i++) {
 			int idx = i + libscroll;
@@ -777,25 +792,31 @@ draw(void)
 			int playing = (nowplaying[0] &&
 			    strcmp(library[idx].title, nowplaying) == 0);
 			mvprintw(i + 2, 0, " ");
-			if (playing) attron(A_REVERSE);
+			attron(COLOR_PAIR(playing ? C_PLAYING : C_NUM));
 			printw("%2d", idx + 1);
-			if (playing) attroff(A_REVERSE);
+			attroff(COLOR_PAIR(playing ? C_PLAYING : C_NUM));
 			printw("  ");
-			if (selected) attron(A_REVERSE);
+			if (selected && visual) attron(COLOR_PAIR(C_VISUAL));
+			else if (selected) attron(A_REVERSE);
 			printw("%.*s", cols - 6, library[idx].title);
-			if (selected) attroff(A_REVERSE);
+			if (selected && visual) attroff(COLOR_PAIR(C_VISUAL));
+			else if (selected) attroff(A_REVERSE);
 		}
 		if (nlib == 0)
 			mvprintw(2, 0, " no tracks - play songs to build your library");
 
 	} else if (mode == MODE_PLAYLIST) {
-		attron(A_BOLD);
 		if (pl_level == 0) {
+			attron(A_BOLD | COLOR_PAIR(C_HEADER));
 			mvprintw(0, 0, " playlists (%d)", nplaylists);
-			attroff(A_BOLD);
+			attroff(A_BOLD | COLOR_PAIR(C_HEADER));
 			for (i = 0; i < visible && i + plscroll < nplaylists; i++) {
 				int idx = i + plscroll;
-				mvprintw(i + 2, 0, " %2d  ", idx + 1);
+				mvprintw(i + 2, 0, " ");
+				attron(COLOR_PAIR(C_NUM));
+				printw("%2d", idx + 1);
+				attroff(COLOR_PAIR(C_NUM));
+				printw("  ");
 				if (idx == sel) attron(A_REVERSE);
 				printw("%.*s", cols - 6, plnames[idx]);
 				if (idx == sel) attroff(A_REVERSE);
@@ -803,32 +824,39 @@ draw(void)
 			if (nplaylists == 0)
 				mvprintw(2, 0, " no playlists - save a queue with 's'");
 		} else {
+			attron(A_BOLD | COLOR_PAIR(C_HEADER));
 			mvprintw(0, 0, " playlist (%d tracks)", npl_tracks);
-			attroff(A_BOLD);
+			attroff(A_BOLD | COLOR_PAIR(C_HEADER));
 			for (i = 0; i < visible && i + plscroll < npl_tracks; i++) {
 				int idx = i + plscroll;
 				int selected = (idx == sel || in_vsel(idx));
 				int playing = (nowplaying[0] &&
 				    strcmp(pl_tracks[idx].title, nowplaying) == 0);
 				mvprintw(i + 2, 0, " ");
-				if (playing) attron(A_REVERSE);
+				attron(COLOR_PAIR(playing ? C_PLAYING : C_NUM));
 				printw("%2d", idx + 1);
-				if (playing) attroff(A_REVERSE);
+				attroff(COLOR_PAIR(playing ? C_PLAYING : C_NUM));
 				printw("  ");
-				if (selected) attron(A_REVERSE);
+				if (selected && visual) attron(COLOR_PAIR(C_VISUAL));
+				else if (selected) attron(A_REVERSE);
 				printw("%.*s", cols - 6, pl_tracks[idx].title);
-				if (selected) attroff(A_REVERSE);
+				if (selected && visual) attroff(COLOR_PAIR(C_VISUAL));
+				else if (selected) attroff(A_REVERSE);
 			}
 			if (npl_tracks == 0)
 				mvprintw(2, 0, " empty playlist");
 		}
 
 	} else if (mode == MODE_PLADD) {
-		attron(A_BOLD);
+		attron(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(0, 0, " add to playlist:");
-		attroff(A_BOLD);
+		attroff(A_BOLD | COLOR_PAIR(C_HEADER));
 		for (i = 0; i < visible && i < nplaylists; i++) {
-			mvprintw(i + 2, 0, " %2d  ", i + 1);
+			mvprintw(i + 2, 0, " ");
+			attron(COLOR_PAIR(C_NUM));
+			printw("%2d", i + 1);
+			attroff(COLOR_PAIR(C_NUM));
+			printw("  ");
 			if (i == sel) attron(A_REVERSE);
 			printw("%.*s", cols - 6, plnames[i]);
 			if (i == sel) attroff(A_REVERSE);
@@ -837,29 +865,32 @@ draw(void)
 			mvprintw(2, 0, " no playlists");
 
 	} else if (mode == MODE_CONFIRM) {
-		attron(A_BOLD);
+		attron(A_BOLD | COLOR_PAIR(C_MODE));
 		mvprintw(0, 0, " %s", confirm_msg);
-		attroff(A_BOLD);
-		mvprintw(2, 0, "   y  confirm");
+		attroff(A_BOLD | COLOR_PAIR(C_MODE));
+		attron(COLOR_PAIR(C_PLAYING));
+		mvprintw(2, 0, "   y");
+		attroff(COLOR_PAIR(C_PLAYING));
+		printw("  confirm");
 		mvprintw(3, 0, "   n  cancel");
 
 	} else if (mode == MODE_PLSAVE) {
-		attron(A_BOLD);
+		attron(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(0, 0, " save playlist:");
-		attroff(A_BOLD);
+		attroff(A_BOLD | COLOR_PAIR(C_HEADER));
 		printw(" %s_", input_buf);
 
 	} else if (mode == MODE_PLRENAME) {
-		attron(A_BOLD);
+		attron(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(0, 0, " rename playlist:");
-		attroff(A_BOLD);
+		attroff(A_BOLD | COLOR_PAIR(C_HEADER));
 		printw(" %s_", input_buf);
 
 	} else {
 		/* search bar */
-		attron(A_BOLD);
+		attron(A_BOLD | COLOR_PAIR(C_SEARCH));
 		mvprintw(0, 0, " /");
-		attroff(A_BOLD);
+		attroff(A_BOLD | COLOR_PAIR(C_SEARCH));
 		printw(" %s", query);
 		if (mode == MODE_SEARCH)
 			addch('_');
@@ -870,14 +901,20 @@ draw(void)
 			int playing = (nowplaying[0] &&
 			    strcmp(results[idx].title, nowplaying) == 0);
 			mvprintw(i + 2, 0, " ");
-			if (playing) attron(A_REVERSE);
+			attron(COLOR_PAIR(playing ? C_PLAYING : C_NUM));
 			printw("%2d", idx + 1);
-			if (playing) attroff(A_REVERSE);
+			attroff(COLOR_PAIR(playing ? C_PLAYING : C_NUM));
 			printw("  ");
-			if (selected) attron(A_REVERSE);
+			if (selected && visual) attron(COLOR_PAIR(C_VISUAL));
+			else if (selected) attron(A_REVERSE);
 			printw("%.*s", cols - 10, results[idx].title);
-			if (selected) attroff(A_REVERSE);
-			printw("%s", lib_has(results[idx].title) ? " *" : "");
+			if (selected && visual) attroff(COLOR_PAIR(C_VISUAL));
+			else if (selected) attroff(A_REVERSE);
+			if (lib_has(results[idx].title)) {
+				attron(COLOR_PAIR(C_DIM) | A_BOLD);
+				printw(" *");
+				attroff(COLOR_PAIR(C_DIM) | A_BOLD);
+			}
 		}
 
 		if (nresults == 0 && query[0] && mode == MODE_BROWSE)
@@ -891,9 +928,18 @@ draw(void)
 		else if (repeat_mode == REP_ALL) rep = "[rep:all]";
 		if (visual) {
 			int n = vsel_max() - vsel_min() + 1;
-			mvprintw(rows - 3, 0, " -- VISUAL (%d) -- %s", n, rep);
+			attron(A_BOLD | COLOR_PAIR(C_MODE));
+			mvprintw(rows - 3, 0, " -- VISUAL (%d) --", n);
+			attroff(A_BOLD | COLOR_PAIR(C_MODE));
+			if (rep[0]) {
+				attron(COLOR_PAIR(C_STATUS));
+				printw(" %s", rep);
+				attroff(COLOR_PAIR(C_STATUS));
+			}
 		} else if (rep[0]) {
+			attron(COLOR_PAIR(C_MODE));
 			mvprintw(rows - 3, 0, " %s", rep);
+			attroff(COLOR_PAIR(C_MODE));
 		}
 	}
 
@@ -909,23 +955,31 @@ draw(void)
 		snprintf(timebuf, sizeof(timebuf), " %d:%02d/%d:%02d ",
 		    pm, ps, dm, ds);
 
+		attron(COLOR_PAIR(C_PLAYING));
+		mvprintw(rows - 2, 0, " %s", paused ? "||" : ">>");
+		attroff(COLOR_PAIR(C_PLAYING));
 		attron(A_BOLD);
-		mvprintw(rows - 2, 0, " %s %.*s",
-		    paused ? "||" : ">>",
-		    cols - 5, nowplaying);
+		printw(" %.*s", cols - 5, nowplaying);
 		attroff(A_BOLD);
 
+		attron(COLOR_PAIR(C_NUM));
+		mvprintw(rows - 1, 0, "%s", timebuf);
+		attroff(COLOR_PAIR(C_NUM));
 		barw = cols - (int)strlen(timebuf);
 		if (barw < 4) barw = 4;
 		filled = (cur_dur > 0) ? (int)(cur_pos / cur_dur * barw) : 0;
 		if (filled > barw) filled = barw;
 
-		mvprintw(rows - 1, 0, "%s", timebuf);
 		for (bi = 0; bi < barw; bi++) {
-			if (bi < filled)
+			if (bi < filled) {
+				attron(COLOR_PAIR(C_BAR));
 				addch(ACS_BLOCK);
-			else
+				attroff(COLOR_PAIR(C_BAR));
+			} else {
+				attron(COLOR_PAIR(C_NUM));
 				addch(ACS_HLINE);
+				attroff(COLOR_PAIR(C_NUM));
+			}
 		}
 	}
 
@@ -995,6 +1049,20 @@ main(void)
 	keypad(stdscr, TRUE);
 	curs_set(0);
 	timeout(200);
+
+	if (has_colors()) {
+		start_color();
+		use_default_colors();
+		init_pair(C_HEADER,  COLOR_BLUE,    -1);
+		init_pair(C_NUM,     COLOR_YELLOW,  -1);
+		init_pair(C_PLAYING, COLOR_GREEN,   -1);
+		init_pair(C_VISUAL,  COLOR_WHITE,   COLOR_BLUE);
+		init_pair(C_STATUS,  COLOR_WHITE,   -1);
+		init_pair(C_BAR,     COLOR_GREEN,   -1);
+		init_pair(C_SEARCH,  COLOR_CYAN,    -1);
+		init_pair(C_MODE,    COLOR_YELLOW,  -1);
+		init_pair(C_DIM,     COLOR_BLACK,   -1);  /* bright black = gray */
+	}
 
 	atexit(cleanup);
 
