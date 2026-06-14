@@ -1,5 +1,5 @@
 CC ?= cc
-CFLAGS = -Wall -O2
+CFLAGS = -Wall -Wextra -Werror -Wno-format-truncation -O2
 LDFLAGS = -lncurses -ltinfo
 PREFIX ?= /usr/local
 
