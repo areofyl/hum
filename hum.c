@@ -1,0 +1,1529 @@
+#include <ncurses.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <time.h>
+
+#include "config.h"
+
+#define MAX_RESULTS  20
+#define MAX_TITLE    512
+#define MAX_URL      768
+#define MAX_QUERY    256
+#define MAX_LIB      1000
+#define SOCK_PATH    "/tmp/hum-mpv.sock"
+
+typedef struct {
+	char title[MAX_TITLE];
+	char url[MAX_URL];
+} Track;
+
+enum {
+	MODE_SEARCH, MODE_BROWSE, MODE_QUEUE, MODE_LIBRARY,
+	MODE_PLAYLIST, MODE_PLSAVE, MODE_PLRENAME, MODE_PLADD, MODE_HELP,
+	MODE_CONFIRM
+};
+
+enum { REP_OFF, REP_ONE, REP_ALL };
+
+static Track results[MAX_RESULTS];
+static int nresults;
+static Track queue[500];
+static int nqueue, qpos = -1;
+static Track library[MAX_LIB];
+static int nlib;
+static int sel, mode = MODE_BROWSE;
+static char query[MAX_QUERY];
+static int qlen;
+static pid_t mpv_pid = -1;
+static int paused;
+static char nowplaying[MAX_TITLE];
+static char libpath[512];
+static int qscroll, libscroll, rscroll;
+static double cur_pos, cur_dur;
+static char plspath[512];
+static char plnames[50][128];
+static int nplaylists;
+static Track pl_tracks[500];
+static int npl_tracks;
+static int pl_level;
+static int plscroll;
+static int pl_cur;
+static char input_buf[128];
+static int input_len;
+static int repeat_mode = REP_OFF;
+
+/* visual mode */
+static int visual;
+static int vsel_start;
+
+/* add-to-playlist state */
+static Track pladd_tracks[500];
+static int npladd;
+static int pladd_ret;
+
+/* rename state */
+static int plrename_idx;
+
+/* confirm state */
+static char confirm_msg[256];
+static int confirm_ret;
+static void (*confirm_action)(void);
+static int confirm_arg;
+
+/* pending confirm actions - defined after functions they call */
+static void do_pl_delete(void);
+static void do_lib_delete(void);
+static void do_queue_clear(void);
+
+/* ---- path helpers ---- */
+
+static void
+resolve_libpath(void)
+{
+	const char *home;
+
+	if (lib_dir[0] == '~') {
+		home = getenv("HOME");
+		if (!home) home = "/tmp";
+		snprintf(libpath, sizeof(libpath), "%s%s", home, lib_dir + 1);
+	} else {
+		snprintf(libpath, sizeof(libpath), "%s", lib_dir);
+	}
+}
+
+static void
+resolve_plspath(void)
+{
+	snprintf(plspath, sizeof(plspath), "%s/playlists", libpath);
+}
+
+static void
+ensure_dir(const char *path)
+{
+	struct stat st;
+	if (stat(path, &st) < 0)
+		mkdir(path, 0755);
+}
+
+/* ---- library ---- */
+
+static void
+lib_scan(void)
+{
+	DIR *d;
+	struct dirent *e;
+	const char *ext;
+
+	nlib = 0;
+	d = opendir(libpath);
+	if (!d)
+		return;
+	while ((e = readdir(d)) && nlib < MAX_LIB) {
+		if (e->d_name[0] == '.')
+			continue;
+		ext = strrchr(e->d_name, '.');
+		if (!ext)
+			continue;
+		if (strcmp(ext, ".mp3") && strcmp(ext, ".opus") &&
+		    strcmp(ext, ".m4a") && strcmp(ext, ".ogg") &&
+		    strcmp(ext, ".flac") && strcmp(ext, ".wav") &&
+		    strcmp(ext, ".webm"))
+			continue;
+		strncpy(library[nlib].title, e->d_name, MAX_TITLE - 1);
+		library[nlib].title[MAX_TITLE - 1] = '\0';
+		char *dot = strrchr(library[nlib].title, '.');
+		if (dot) *dot = '\0';
+		snprintf(library[nlib].url, MAX_URL, "%s/%s", libpath, e->d_name);
+		nlib++;
+	}
+	closedir(d);
+}
+
+static int
+lib_has(const char *title)
+{
+	int i;
+	for (i = 0; i < nlib; i++) {
+		if (strcmp(library[i].title, title) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+static void
+lib_delete(int idx)
+{
+	if (idx < 0 || idx >= nlib)
+		return;
+	unlink(library[idx].url);
+	lib_scan();
+	if (sel >= nlib) sel = nlib - 1;
+	if (sel < 0) sel = 0;
+}
+
+/* ---- playlists ---- */
+
+static void
+pl_scan(void)
+{
+	DIR *d;
+	struct dirent *e;
+	const char *ext;
+
+	nplaylists = 0;
+	d = opendir(plspath);
+	if (!d)
+		return;
+	while ((e = readdir(d)) && nplaylists < 50) {
+		if (e->d_name[0] == '.')
+			continue;
+		ext = strrchr(e->d_name, '.');
+		if (!ext || strcmp(ext, ".hum"))
+			continue;
+		strncpy(plnames[nplaylists], e->d_name, 127);
+		plnames[nplaylists][127] = '\0';
+		char *dot = strrchr(plnames[nplaylists], '.');
+		if (dot) *dot = '\0';
+		nplaylists++;
+	}
+	closedir(d);
+}
+
+static void
+pl_load(int idx)
+{
+	char path[768];
+	FILE *fp;
+	char line[MAX_TITLE + MAX_URL];
+
+	snprintf(path, sizeof(path), "%s/%s.hum", plspath, plnames[idx]);
+	fp = fopen(path, "r");
+	if (!fp)
+		return;
+	npl_tracks = 0;
+	while (fgets(line, sizeof(line), fp) && npl_tracks < 500) {
+		char *tab = strchr(line, '\t');
+		if (!tab)
+			continue;
+		*tab = '\0';
+		tab++;
+		tab[strcspn(tab, "\n")] = '\0';
+		strncpy(pl_tracks[npl_tracks].title, line, MAX_TITLE - 1);
+		pl_tracks[npl_tracks].title[MAX_TITLE - 1] = '\0';
+		strncpy(pl_tracks[npl_tracks].url, tab, MAX_URL - 1);
+		pl_tracks[npl_tracks].url[MAX_URL - 1] = '\0';
+		npl_tracks++;
+	}
+	fclose(fp);
+	pl_cur = idx;
+}
+
+static void
+pl_write(int idx)
+{
+	char path[768];
+	FILE *fp;
+	int i;
+
+	snprintf(path, sizeof(path), "%s/%s.hum", plspath, plnames[idx]);
+	fp = fopen(path, "w");
+	if (!fp)
+		return;
+	for (i = 0; i < npl_tracks; i++)
+		fprintf(fp, "%s\t%s\n", pl_tracks[i].title, pl_tracks[i].url);
+	fclose(fp);
+}
+
+static void
+pl_save(const char *name)
+{
+	char path[768];
+	FILE *fp;
+	int i;
+
+	if (nqueue == 0)
+		return;
+	snprintf(path, sizeof(path), "%s/%s.hum", plspath, name);
+	fp = fopen(path, "w");
+	if (!fp)
+		return;
+	for (i = 0; i < nqueue; i++)
+		fprintf(fp, "%s\t%s\n", queue[i].title, queue[i].url);
+	fclose(fp);
+}
+
+static void
+pl_delete(int idx)
+{
+	char path[768];
+
+	if (idx < 0 || idx >= nplaylists)
+		return;
+	snprintf(path, sizeof(path), "%s/%s.hum", plspath, plnames[idx]);
+	unlink(path);
+	pl_scan();
+	if (sel >= nplaylists) sel = nplaylists - 1;
+	if (sel < 0) sel = 0;
+}
+
+static void
+pl_rename(int idx, const char *newname)
+{
+	char oldpath[768], newpath[768];
+
+	if (idx < 0 || idx >= nplaylists)
+		return;
+	snprintf(oldpath, sizeof(oldpath), "%s/%s.hum", plspath, plnames[idx]);
+	snprintf(newpath, sizeof(newpath), "%s/%s.hum", plspath, newname);
+	rename(oldpath, newpath);
+	pl_scan();
+}
+
+static void
+pl_del_track(int tidx)
+{
+	int i;
+
+	if (tidx < 0 || tidx >= npl_tracks)
+		return;
+	for (i = tidx; i < npl_tracks - 1; i++)
+		pl_tracks[i] = pl_tracks[i + 1];
+	npl_tracks--;
+	pl_write(pl_cur);
+	if (sel >= npl_tracks) sel = npl_tracks - 1;
+	if (sel < 0) sel = 0;
+}
+
+static void
+pl_append_tracks(int idx, Track *tracks, int n)
+{
+	char path[768];
+	FILE *fp;
+	int i;
+
+	if (idx < 0 || idx >= nplaylists)
+		return;
+	snprintf(path, sizeof(path), "%s/%s.hum", plspath, plnames[idx]);
+	fp = fopen(path, "a");
+	if (!fp)
+		return;
+	for (i = 0; i < n; i++)
+		fprintf(fp, "%s\t%s\n", tracks[i].title, tracks[i].url);
+	fclose(fp);
+}
+
+/* ---- mpv ---- */
+
+static int
+mpv_connect(void)
+{
+	struct sockaddr_un addr = {0};
+	int fd;
+
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0)
+		return -1;
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static void
+mpv_cmd(const char *cmd)
+{
+	int fd = mpv_connect();
+	if (fd < 0)
+		return;
+	write(fd, cmd, strlen(cmd));
+	write(fd, "\n", 1);
+	close(fd);
+}
+
+static double
+mpv_get_prop(const char *prop)
+{
+	int fd;
+	char cmd[128], buf[1024];
+	ssize_t n;
+	char *dptr;
+
+	fd = mpv_connect();
+	if (fd < 0)
+		return -1;
+	snprintf(cmd, sizeof(cmd),
+	    "{\"command\":[\"get_property\",\"%s\"]}\n", prop);
+	write(fd, cmd, strlen(cmd));
+
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+	buf[n] = '\0';
+
+	dptr = strstr(buf, "\"data\":");
+	if (!dptr)
+		return -1;
+	return atof(dptr + 7);
+}
+
+static void
+mpv_get_progress(void)
+{
+	if (mpv_pid <= 0)
+		return;
+	cur_pos = mpv_get_prop("time-pos");
+	cur_dur = mpv_get_prop("duration");
+	if (cur_pos < 0) cur_pos = 0;
+	if (cur_dur < 0) cur_dur = 0;
+}
+
+static void
+mpv_stop(void)
+{
+	if (mpv_pid > 0) {
+		kill(mpv_pid, SIGTERM);
+		waitpid(mpv_pid, NULL, 0);
+		mpv_pid = -1;
+	}
+	unlink(SOCK_PATH);
+}
+
+static void
+mpv_play(const char *url, const char *title)
+{
+	mpv_stop();
+	mpv_pid = fork();
+	if (mpv_pid == 0) {
+		close(STDIN_FILENO);
+		close(STDOUT_FILENO);
+		close(STDERR_FILENO);
+		execlp("mpv", "mpv", "--no-video", "--really-quiet",
+		    "--input-ipc-server=" SOCK_PATH, url, NULL);
+		_exit(1);
+	}
+	strncpy(nowplaying, title, sizeof(nowplaying) - 1);
+	nowplaying[sizeof(nowplaying) - 1] = '\0';
+	paused = 0;
+}
+
+static void
+lib_download(const char *url, const char *title)
+{
+	pid_t pid;
+	char out[768];
+
+	if (lib_has(title))
+		return;
+	snprintf(out, sizeof(out), "%s/%%(title)s.%%(ext)s", libpath);
+	pid = fork();
+	if (pid == 0) {
+		close(STDIN_FILENO);
+		close(STDOUT_FILENO);
+		close(STDERR_FILENO);
+		execlp("yt-dlp", "yt-dlp", "-x", "--audio-format", "opus",
+		    "-o", out, url, NULL);
+		_exit(1);
+	}
+}
+
+/* ---- search ---- */
+
+static void
+do_search(const char *q)
+{
+	int pipefd[2];
+	pid_t pid;
+	char arg[MAX_QUERY + 16];
+	char line[MAX_TITLE + MAX_URL];
+	FILE *fp;
+
+	if (pipe(pipefd) < 0)
+		return;
+	snprintf(arg, sizeof(arg), "ytsearch%d:%s", search_count, q);
+
+	pid = fork();
+	if (pid == 0) {
+		close(pipefd[0]);
+		dup2(pipefd[1], STDOUT_FILENO);
+		close(pipefd[1]);
+		close(STDERR_FILENO);
+		execlp("yt-dlp", "yt-dlp", "--flat-playlist",
+		    "--print", "%(title)s\t%(id)s", arg, NULL);
+		_exit(1);
+	}
+	close(pipefd[1]);
+
+	fp = fdopen(pipefd[0], "r");
+	if (!fp) {
+		close(pipefd[0]);
+		waitpid(pid, NULL, 0);
+		return;
+	}
+
+	nresults = 0;
+	while (fgets(line, sizeof(line), fp) && nresults < MAX_RESULTS) {
+		char *tab = strchr(line, '\t');
+		if (!tab)
+			continue;
+		*tab = '\0';
+		tab++;
+		tab[strcspn(tab, "\n")] = '\0';
+		strncpy(results[nresults].title, line, MAX_TITLE - 1);
+		results[nresults].title[MAX_TITLE - 1] = '\0';
+		snprintf(results[nresults].url, MAX_URL,
+		    "https://www.youtube.com/watch?v=%s", tab);
+		nresults++;
+	}
+	fclose(fp);
+	waitpid(pid, NULL, 0);
+	sel = 0;
+}
+
+/* ---- queue helpers ---- */
+
+static void
+queue_add(Track *t)
+{
+	if (nqueue < 500)
+		queue[nqueue++] = *t;
+}
+
+static void
+queue_del(int idx)
+{
+	int i;
+
+	if (idx < 0 || idx >= nqueue)
+		return;
+	if (qpos == idx) {
+		/* deleting currently playing track - stop */
+		mpv_stop();
+		nowplaying[0] = '\0';
+		cur_pos = cur_dur = 0;
+	}
+	for (i = idx; i < nqueue - 1; i++)
+		queue[i] = queue[i + 1];
+	nqueue--;
+	if (qpos > idx) qpos--;
+	if (qpos >= nqueue) qpos = nqueue - 1;
+	if (sel >= nqueue) sel = nqueue - 1;
+	if (sel < 0) sel = 0;
+}
+
+static void
+queue_clear(void)
+{
+	mpv_stop();
+	nowplaying[0] = '\0';
+	cur_pos = cur_dur = 0;
+	nqueue = 0;
+	qpos = -1;
+	sel = 0;
+	qscroll = 0;
+}
+
+static void do_pl_delete(void) { pl_delete(confirm_arg); }
+static void do_lib_delete(void) { lib_delete(confirm_arg); }
+static void do_queue_clear(void) { queue_clear(); }
+
+static void
+queue_move(int from, int to)
+{
+	Track tmp;
+
+	if (from < 0 || from >= nqueue || to < 0 || to >= nqueue)
+		return;
+	tmp = queue[from];
+	queue[from] = queue[to];
+	queue[to] = tmp;
+	if (qpos == from) qpos = to;
+	else if (qpos == to) qpos = from;
+}
+
+static void
+queue_shuffle(void)
+{
+	int i, j;
+	Track tmp;
+
+	if (nqueue < 2)
+		return;
+	srand(time(NULL));
+	for (i = nqueue - 1; i > 0; i--) {
+		j = rand() % (i + 1);
+		tmp = queue[i];
+		queue[i] = queue[j];
+		queue[j] = tmp;
+	}
+	/* find where current track ended up */
+	if (nowplaying[0]) {
+		for (i = 0; i < nqueue; i++) {
+			if (strcmp(queue[i].title, nowplaying) == 0) {
+				qpos = i;
+				break;
+			}
+		}
+	}
+}
+
+/* ---- playback ---- */
+
+static void
+play_next(void)
+{
+	if (repeat_mode == REP_ONE && qpos >= 0 && qpos < nqueue) {
+		mpv_play(queue[qpos].url, queue[qpos].title);
+		return;
+	}
+	if (qpos + 1 < nqueue) {
+		qpos++;
+		mpv_play(queue[qpos].url, queue[qpos].title);
+		lib_download(queue[qpos].url, queue[qpos].title);
+	} else if (repeat_mode == REP_ALL && nqueue > 0) {
+		qpos = 0;
+		mpv_play(queue[qpos].url, queue[qpos].title);
+	}
+}
+
+static void
+play_prev(void)
+{
+	if (qpos > 0) {
+		qpos--;
+		mpv_play(queue[qpos].url, queue[qpos].title);
+	}
+}
+
+static void
+play_selected(void)
+{
+	if (mode == MODE_LIBRARY) {
+		if (sel < 0 || sel >= nlib)
+			return;
+		queue_add(&library[sel]);
+		qpos = nqueue - 1;
+		mpv_play(library[sel].url, library[sel].title);
+		return;
+	}
+	if (mode == MODE_QUEUE) {
+		if (sel < 0 || sel >= nqueue)
+			return;
+		qpos = sel;
+		mpv_play(queue[sel].url, queue[sel].title);
+		lib_download(queue[sel].url, queue[sel].title);
+		return;
+	}
+	if (sel < 0 || sel >= nresults)
+		return;
+	queue_add(&results[sel]);
+	lib_download(results[sel].url, results[sel].title);
+	if (mpv_pid <= 0 || waitpid(mpv_pid, NULL, WNOHANG) > 0) {
+		mpv_pid = -1;
+		qpos = nqueue - 1;
+		mpv_play(results[sel].url, results[sel].title);
+	}
+}
+
+static void
+cleanup(void)
+{
+	mpv_stop();
+	endwin();
+}
+
+/* ---- visual mode helpers ---- */
+
+static int
+vsel_min(void)
+{
+	return vsel_start < sel ? vsel_start : sel;
+}
+
+static int
+vsel_max(void)
+{
+	return vsel_start > sel ? vsel_start : sel;
+}
+
+static int
+in_vsel(int idx)
+{
+	if (!visual) return 0;
+	return idx >= vsel_min() && idx <= vsel_max();
+}
+
+/* ---- list length ---- */
+
+static int
+list_len(void)
+{
+	if (mode == MODE_QUEUE) return nqueue;
+	if (mode == MODE_LIBRARY) return nlib;
+	if (mode == MODE_PLAYLIST)
+		return pl_level == 0 ? nplaylists : npl_tracks;
+	if (mode == MODE_PLADD) return nplaylists;
+	return nresults;
+}
+
+/* ---- draw ---- */
+
+static void
+draw(void)
+{
+	int rows, cols, i, visible;
+	getmaxyx(stdscr, rows, cols);
+
+	erase();
+	visible = rows - 5;
+	if (visible < 1) visible = 1;
+
+	if (mode == MODE_HELP) {
+		int y = 0;
+		attron(A_BOLD);
+		mvprintw(y++, 0, " hum - help");
+		attroff(A_BOLD);
+		y++;
+		attron(A_BOLD);
+		mvprintw(y++, 0, " navigation");
+		attroff(A_BOLD);
+		mvprintw(y++, 0, "   j/k          move down/up");
+		mvprintw(y++, 0, "   g/G          jump to top/bottom");
+		mvprintw(y++, 0, "   Esc /        search youtube");
+		mvprintw(y++, 0, "   v            view queue");
+		mvprintw(y++, 0, "   b            browse library");
+		mvprintw(y++, 0, "   Esc p        open playlists");
+		mvprintw(y++, 0, "   Esc / q      go back");
+		mvprintw(y++, 0, "   ?            this help page");
+		y++;
+		attron(A_BOLD);
+		mvprintw(y++, 0, " playback");
+		attroff(A_BOLD);
+		mvprintw(y++, 0, "   l / Enter    play selected");
+		mvprintw(y++, 0, "   Space        pause/resume");
+		mvprintw(y++, 0, "   n            next track");
+		mvprintw(y++, 0, "   p            previous track");
+		mvprintw(y++, 0, "   x            stop playback");
+		mvprintw(y++, 0, "   ,  .         seek back/forward 5s");
+		mvprintw(y++, 0, "   +  -         volume up/down");
+		mvprintw(y++, 0, "   r            cycle repeat (off/one/all)");
+		y++;
+		attron(A_BOLD);
+		mvprintw(y++, 0, " queue");
+		attroff(A_BOLD);
+		mvprintw(y++, 0, "   a            add to queue");
+		mvprintw(y++, 0, "   d            delete from queue");
+		mvprintw(y++, 0, "   c            clear queue");
+		mvprintw(y++, 0, "   J/K          move track down/up");
+		mvprintw(y++, 0, "   S            shuffle queue");
+		mvprintw(y++, 0, "   s            save queue as playlist");
+		y++;
+		attron(A_BOLD);
+		mvprintw(y++, 0, " playlists");
+		attroff(A_BOLD);
+		mvprintw(y++, 0, "   l / Enter    enter playlist / play track");
+		mvprintw(y++, 0, "   h            go back one level");
+		mvprintw(y++, 0, "   A            add selected to playlist");
+		mvprintw(y++, 0, "   d            delete playlist / track");
+		mvprintw(y++, 0, "   R            rename playlist");
+		y++;
+		attron(A_BOLD);
+		mvprintw(y++, 0, " visual mode");
+		attroff(A_BOLD);
+		mvprintw(y++, 0, "   V            toggle visual selection");
+		mvprintw(y++, 0, "   a/A/d        act on selection");
+
+	} else if (mode == MODE_QUEUE) {
+		attron(A_BOLD);
+		mvprintw(0, 0, " queue (%d tracks)", nqueue);
+		attroff(A_BOLD);
+
+		for (i = 0; i < visible && i + qscroll < nqueue; i++) {
+			int idx = i + qscroll;
+			int playing = (idx == qpos && nowplaying[0]);
+			int selected = (idx == sel || in_vsel(idx));
+			mvprintw(i + 2, 0, " %s", idx == qpos ? ">> " : "   ");
+			if (playing) attron(A_REVERSE);
+			printw("%2d", idx + 1);
+			if (playing) attroff(A_REVERSE);
+			printw("  ");
+			if (selected) attron(A_REVERSE);
+			printw("%.*s", cols - 9, queue[idx].title);
+			if (selected) attroff(A_REVERSE);
+		}
+		if (nqueue == 0)
+			mvprintw(2, 0, " empty");
+
+	} else if (mode == MODE_LIBRARY) {
+		attron(A_BOLD);
+		mvprintw(0, 0, " library (%d tracks)", nlib);
+		attroff(A_BOLD);
+
+		for (i = 0; i < visible && i + libscroll < nlib; i++) {
+			int idx = i + libscroll;
+			int selected = (idx == sel || in_vsel(idx));
+			int playing = (nowplaying[0] &&
+			    strcmp(library[idx].title, nowplaying) == 0);
+			mvprintw(i + 2, 0, " ");
+			if (playing) attron(A_REVERSE);
+			printw("%2d", idx + 1);
+			if (playing) attroff(A_REVERSE);
+			printw("  ");
+			if (selected) attron(A_REVERSE);
+			printw("%.*s", cols - 6, library[idx].title);
+			if (selected) attroff(A_REVERSE);
+		}
+		if (nlib == 0)
+			mvprintw(2, 0, " no tracks - play songs to build your library");
+
+	} else if (mode == MODE_PLAYLIST) {
+		attron(A_BOLD);
+		if (pl_level == 0) {
+			mvprintw(0, 0, " playlists (%d)", nplaylists);
+			attroff(A_BOLD);
+			for (i = 0; i < visible && i + plscroll < nplaylists; i++) {
+				int idx = i + plscroll;
+				mvprintw(i + 2, 0, " %2d  ", idx + 1);
+				if (idx == sel) attron(A_REVERSE);
+				printw("%.*s", cols - 6, plnames[idx]);
+				if (idx == sel) attroff(A_REVERSE);
+			}
+			if (nplaylists == 0)
+				mvprintw(2, 0, " no playlists - save a queue with 's'");
+		} else {
+			mvprintw(0, 0, " playlist (%d tracks)", npl_tracks);
+			attroff(A_BOLD);
+			for (i = 0; i < visible && i + plscroll < npl_tracks; i++) {
+				int idx = i + plscroll;
+				int selected = (idx == sel || in_vsel(idx));
+				int playing = (nowplaying[0] &&
+				    strcmp(pl_tracks[idx].title, nowplaying) == 0);
+				mvprintw(i + 2, 0, " ");
+				if (playing) attron(A_REVERSE);
+				printw("%2d", idx + 1);
+				if (playing) attroff(A_REVERSE);
+				printw("  ");
+				if (selected) attron(A_REVERSE);
+				printw("%.*s", cols - 6, pl_tracks[idx].title);
+				if (selected) attroff(A_REVERSE);
+			}
+			if (npl_tracks == 0)
+				mvprintw(2, 0, " empty playlist");
+		}
+
+	} else if (mode == MODE_PLADD) {
+		attron(A_BOLD);
+		mvprintw(0, 0, " add to playlist:");
+		attroff(A_BOLD);
+		for (i = 0; i < visible && i < nplaylists; i++) {
+			mvprintw(i + 2, 0, " %2d  ", i + 1);
+			if (i == sel) attron(A_REVERSE);
+			printw("%.*s", cols - 6, plnames[i]);
+			if (i == sel) attroff(A_REVERSE);
+		}
+		if (nplaylists == 0)
+			mvprintw(2, 0, " no playlists");
+
+	} else if (mode == MODE_CONFIRM) {
+		attron(A_BOLD);
+		mvprintw(0, 0, " %s", confirm_msg);
+		attroff(A_BOLD);
+		mvprintw(2, 0, "   y  confirm");
+		mvprintw(3, 0, "   n  cancel");
+
+	} else if (mode == MODE_PLSAVE) {
+		attron(A_BOLD);
+		mvprintw(0, 0, " save playlist:");
+		attroff(A_BOLD);
+		printw(" %s_", input_buf);
+
+	} else if (mode == MODE_PLRENAME) {
+		attron(A_BOLD);
+		mvprintw(0, 0, " rename playlist:");
+		attroff(A_BOLD);
+		printw(" %s_", input_buf);
+
+	} else {
+		/* search bar */
+		attron(A_BOLD);
+		mvprintw(0, 0, " /");
+		attroff(A_BOLD);
+		printw(" %s", query);
+		if (mode == MODE_SEARCH)
+			addch('_');
+
+		for (i = 0; i < visible && i + rscroll < nresults; i++) {
+			int idx = i + rscroll;
+			int selected = ((idx == sel && mode == MODE_BROWSE) || in_vsel(idx));
+			int playing = (nowplaying[0] &&
+			    strcmp(results[idx].title, nowplaying) == 0);
+			mvprintw(i + 2, 0, " ");
+			if (playing) attron(A_REVERSE);
+			printw("%2d", idx + 1);
+			if (playing) attroff(A_REVERSE);
+			printw("  ");
+			if (selected) attron(A_REVERSE);
+			printw("%.*s", cols - 10, results[idx].title);
+			if (selected) attroff(A_REVERSE);
+			printw("%s", lib_has(results[idx].title) ? " *" : "");
+		}
+
+		if (nresults == 0 && query[0] && mode == MODE_BROWSE)
+			mvprintw(2, 0, " no results");
+	}
+
+	/* status indicators on row before now-playing */
+	{
+		const char *rep = "";
+		if (repeat_mode == REP_ONE) rep = "[rep:1]";
+		else if (repeat_mode == REP_ALL) rep = "[rep:all]";
+		if (visual) {
+			int n = vsel_max() - vsel_min() + 1;
+			mvprintw(rows - 3, 0, " -- VISUAL (%d) -- %s", n, rep);
+		} else if (rep[0]) {
+			mvprintw(rows - 3, 0, " %s", rep);
+		}
+	}
+
+	/* now playing + progress bar */
+	if (nowplaying[0]) {
+		int pm, ps, dm, ds, barw, filled, bi;
+		char timebuf[32];
+
+		pm = (int)cur_pos / 60;
+		ps = (int)cur_pos % 60;
+		dm = (int)cur_dur / 60;
+		ds = (int)cur_dur % 60;
+		snprintf(timebuf, sizeof(timebuf), " %d:%02d/%d:%02d ",
+		    pm, ps, dm, ds);
+
+		attron(A_BOLD);
+		mvprintw(rows - 2, 0, " %s %.*s",
+		    paused ? "||" : ">>",
+		    cols - 5, nowplaying);
+		attroff(A_BOLD);
+
+		barw = cols - (int)strlen(timebuf);
+		if (barw < 4) barw = 4;
+		filled = (cur_dur > 0) ? (int)(cur_pos / cur_dur * barw) : 0;
+		if (filled > barw) filled = barw;
+
+		mvprintw(rows - 1, 0, "%s", timebuf);
+		for (bi = 0; bi < barw; bi++) {
+			if (bi < filled)
+				addch(ACS_BLOCK);
+			else
+				addch(ACS_HLINE);
+		}
+	}
+
+	refresh();
+}
+
+/* ---- scroll helper ---- */
+
+static void
+scroll_into_view(int *scroll)
+{
+	int rows, cols, visible;
+	getmaxyx(stdscr, rows, cols);
+	(void)cols;
+	visible = rows - 5;
+	if (visible < 1) visible = 1;
+	if (sel < *scroll)
+		*scroll = sel;
+	if (sel >= *scroll + visible)
+		*scroll = sel - visible + 1;
+}
+
+static int *
+cur_scroll(void)
+{
+	if (mode == MODE_QUEUE) return &qscroll;
+	if (mode == MODE_LIBRARY) return &libscroll;
+	if (mode == MODE_PLAYLIST) return &plscroll;
+	if (mode == MODE_BROWSE) return &rscroll;
+	return NULL;
+}
+
+/* ---- input mode handler (shared for search, plsave, plrename) ---- */
+
+static int
+handle_text_input(int ch, char *buf, int *len, int maxlen)
+{
+	if (ch == '\n' || ch == KEY_ENTER)
+		return 1; /* submit */
+	if (ch == 27)
+		return -1; /* cancel */
+	if (ch == KEY_BACKSPACE || ch == 127) {
+		if (*len > 0)
+			buf[--(*len)] = '\0';
+	} else if (*len < maxlen - 1 && ch >= 32 && ch < 127) {
+		buf[(*len)++] = ch;
+		buf[*len] = '\0';
+	}
+	return 0; /* continue */
+}
+
+/* ---- main ---- */
+
+int
+main(void)
+{
+	int ch;
+
+	resolve_libpath();
+	ensure_dir(libpath);
+	resolve_plspath();
+	ensure_dir(plspath);
+
+	initscr();
+	cbreak();
+	noecho();
+	keypad(stdscr, TRUE);
+	curs_set(0);
+	timeout(200);
+
+	atexit(cleanup);
+
+	pl_scan();
+	if (nplaylists > 0) {
+		mode = MODE_PLAYLIST;
+		pl_level = 0;
+		sel = 0;
+		plscroll = 0;
+	} else {
+		mode = MODE_BROWSE;
+	}
+	draw();
+
+	for (;;) {
+		ch = getch();
+
+		if (ch == ERR) {
+			if (mpv_pid > 0 && waitpid(mpv_pid, NULL, WNOHANG) > 0) {
+				mpv_pid = -1;
+				nowplaying[0] = '\0';
+				cur_pos = cur_dur = 0;
+				play_next();
+			}
+			waitpid(-1, NULL, WNOHANG);
+			mpv_get_progress();
+			draw();
+			continue;
+		}
+
+		/* ---- text input modes ---- */
+
+		if (mode == MODE_SEARCH) {
+			int r = handle_text_input(ch, query, &qlen, MAX_QUERY);
+			if (r == 1 && qlen > 0) {
+				mode = MODE_BROWSE;
+				erase();
+				mvprintw(0, 0, " searching...");
+				refresh();
+				do_search(query);
+				rscroll = 0;
+			} else if (r == -1) {
+				mode = MODE_BROWSE;
+			}
+			draw();
+			continue;
+		}
+
+		if (mode == MODE_PLSAVE) {
+			int r = handle_text_input(ch, input_buf, &input_len, 128);
+			if (r == 1 && input_len > 0) {
+				pl_save(input_buf);
+				mode = MODE_QUEUE;
+			} else if (r == -1) {
+				mode = MODE_QUEUE;
+			}
+			draw();
+			continue;
+		}
+
+		if (mode == MODE_PLRENAME) {
+			int r = handle_text_input(ch, input_buf, &input_len, 128);
+			if (r == 1 && input_len > 0) {
+				pl_rename(plrename_idx, input_buf);
+				mode = MODE_PLAYLIST;
+			} else if (r == -1) {
+				mode = MODE_PLAYLIST;
+			}
+			draw();
+			continue;
+		}
+
+		if (mode == MODE_HELP) {
+			mode = MODE_BROWSE;
+			sel = 0;
+			visual = 0;
+			draw();
+			continue;
+		}
+
+		if (mode == MODE_CONFIRM) {
+			if (ch == 'y' || ch == 'Y') {
+				if (confirm_action)
+					confirm_action();
+			}
+			mode = confirm_ret;
+			draw();
+			continue;
+		}
+
+		/* ---- add-to-playlist picker ---- */
+
+		if (mode == MODE_PLADD) {
+			if (ch == key_up || ch == KEY_UP) {
+				if (sel > 0) sel--;
+			} else if (ch == key_down || ch == KEY_DOWN) {
+				if (sel < nplaylists - 1) sel++;
+			} else if (ch == '\n' || ch == KEY_ENTER || ch == 'l') {
+				if (sel >= 0 && sel < nplaylists) {
+					pl_append_tracks(sel, pladd_tracks, npladd);
+					mode = pladd_ret;
+					visual = 0;
+				}
+			} else if (ch == 27 || ch == 'h' || ch == key_quit) {
+				mode = pladd_ret;
+				visual = 0;
+			}
+			draw();
+			continue;
+		}
+
+		/* ---- global playback keys (work in all normal modes) ---- */
+
+		if (ch == key_pause) {
+			mpv_cmd("{\"command\":[\"cycle\",\"pause\"]}");
+			paused = !paused;
+			draw();
+			continue;
+		}
+		if (ch == key_next) {
+			play_next();
+			draw();
+			continue;
+		}
+		if (ch == key_prev) {
+			play_prev();
+			draw();
+			continue;
+		}
+		if (ch == key_stop) {
+			mpv_stop();
+			nowplaying[0] = '\0';
+			cur_pos = cur_dur = 0;
+			paused = 0;
+			draw();
+			continue;
+		}
+		if (ch == key_seek_fwd) {
+			char cmd[64];
+			snprintf(cmd, sizeof(cmd),
+			    "{\"command\":[\"seek\",\"%d\"]}", seek_step);
+			mpv_cmd(cmd);
+			draw();
+			continue;
+		}
+		if (ch == key_seek_bwd) {
+			char cmd[64];
+			snprintf(cmd, sizeof(cmd),
+			    "{\"command\":[\"seek\",\"-%d\"]}", seek_step);
+			mpv_cmd(cmd);
+			draw();
+			continue;
+		}
+		if (ch == key_vol_up) {
+			char cmd[64];
+			snprintf(cmd, sizeof(cmd),
+			    "{\"command\":[\"add\",\"volume\",%d]}", vol_step);
+			mpv_cmd(cmd);
+			draw();
+			continue;
+		}
+		if (ch == key_vol_dn) {
+			char cmd[64];
+			snprintf(cmd, sizeof(cmd),
+			    "{\"command\":[\"add\",\"volume\",%d]}", -vol_step);
+			mpv_cmd(cmd);
+			draw();
+			continue;
+		}
+		if (ch == key_repeat) {
+			repeat_mode = (repeat_mode + 1) % 3;
+			draw();
+			continue;
+		}
+
+		/* ---- navigation (shared) ---- */
+
+		if (ch == key_up || ch == KEY_UP) {
+			if (sel > 0) sel--;
+			int *s = cur_scroll();
+			if (s) scroll_into_view(s);
+			draw();
+			continue;
+		}
+		if (ch == key_down || ch == KEY_DOWN) {
+			if (sel < list_len() - 1) sel++;
+			int *s = cur_scroll();
+			if (s) scroll_into_view(s);
+			draw();
+			continue;
+		}
+		if (ch == key_top) {
+			sel = 0;
+			int *s = cur_scroll();
+			if (s) *s = 0;
+			draw();
+			continue;
+		}
+		if (ch == key_bottom) {
+			sel = list_len() - 1;
+			if (sel < 0) sel = 0;
+			int *s = cur_scroll();
+			if (s) scroll_into_view(s);
+			draw();
+			continue;
+		}
+		if (ch == key_visual) {
+			if (visual) {
+				visual = 0;
+			} else {
+				visual = 1;
+				vsel_start = sel;
+			}
+			draw();
+			continue;
+		}
+
+		/* ---- shared Esc sequences ---- */
+
+		if (ch == 27 && mode != MODE_BROWSE) {
+			int next = getch();
+			if (next == '/') {
+				mode = MODE_SEARCH;
+				qlen = 0;
+				query[0] = '\0';
+				visual = 0;
+				draw();
+				continue;
+			} else if (next == 'p') {
+				mode = MODE_PLAYLIST;
+				pl_scan();
+				pl_level = 0;
+				sel = 0;
+				plscroll = 0;
+				visual = 0;
+				draw();
+				continue;
+			} else if (next != ERR) {
+				ungetch(next);
+			}
+			/* fall through - mode-specific Esc/q handling below */
+		}
+
+		/* ---- shared mode switching ---- */
+
+		if (ch == key_qview && mode != MODE_QUEUE && mode != MODE_BROWSE) {
+			mode = MODE_QUEUE;
+			sel = qpos >= 0 ? qpos : 0;
+			qscroll = 0;
+			visual = 0;
+			draw();
+			continue;
+		}
+		if (ch == key_lib && mode != MODE_LIBRARY && mode != MODE_BROWSE) {
+			mode = MODE_LIBRARY;
+			lib_scan();
+			sel = 0;
+			libscroll = 0;
+			visual = 0;
+			draw();
+			continue;
+		}
+		if (ch == '?' && mode != MODE_BROWSE) {
+			mode = MODE_HELP;
+			visual = 0;
+			draw();
+			continue;
+		}
+
+		/* ---- mode-specific keys ---- */
+
+		if (mode == MODE_PLAYLIST) {
+			if (ch == 'l' || ch == '\n' || ch == KEY_ENTER) {
+				if (pl_level == 0 && sel >= 0 && sel < nplaylists) {
+					pl_load(sel);
+					pl_level = 1;
+					sel = 0;
+					plscroll = 0;
+					visual = 0;
+				} else if (pl_level == 1 && sel >= 0 && sel < npl_tracks) {
+					int j;
+					nqueue = 0;
+					for (j = 0; j < npl_tracks; j++)
+						queue_add(&pl_tracks[j]);
+					qpos = sel;
+					mpv_play(queue[qpos].url, queue[qpos].title);
+					visual = 0;
+				}
+			} else if (ch == 'h') {
+				if (pl_level == 1) {
+					pl_level = 0;
+					sel = pl_cur;
+					plscroll = 0;
+					visual = 0;
+				} else {
+					mode = MODE_BROWSE;
+					sel = 0;
+					visual = 0;
+				}
+			} else if (ch == key_queue) {
+				if (pl_level == 1) {
+					if (visual) {
+						int lo = vsel_min(), hi = vsel_max(), j;
+						for (j = lo; j <= hi && j < npl_tracks; j++)
+							queue_add(&pl_tracks[j]);
+						visual = 0;
+					} else if (sel >= 0 && sel < npl_tracks) {
+						queue_add(&pl_tracks[sel]);
+					}
+				}
+			} else if (ch == key_del) {
+				if (pl_level == 0 && sel >= 0 && sel < nplaylists) {
+					snprintf(confirm_msg, sizeof(confirm_msg),
+					    "delete playlist '%s'?", plnames[sel]);
+					confirm_arg = sel;
+					confirm_action = do_pl_delete;
+					confirm_ret = MODE_PLAYLIST;
+					mode = MODE_CONFIRM;
+				} else if (pl_level == 1) {
+					if (visual) {
+						int lo = vsel_min(), hi = vsel_max(), j;
+						for (j = hi; j >= lo; j--)
+							pl_del_track(j);
+						visual = 0;
+					} else {
+						pl_del_track(sel);
+					}
+				}
+			} else if (ch == key_rename) {
+				if (pl_level == 0 && sel >= 0 && sel < nplaylists) {
+					plrename_idx = sel;
+					input_len = 0;
+					input_buf[0] = '\0';
+					strncpy(input_buf, plnames[sel], 127);
+					input_len = strlen(input_buf);
+					mode = MODE_PLRENAME;
+				}
+			} else if (ch == key_quit || ch == 27) {
+				if (pl_level == 1) {
+					pl_level = 0;
+					sel = pl_cur;
+					plscroll = 0;
+				} else {
+					mode = MODE_BROWSE;
+					sel = 0;
+				}
+				visual = 0;
+			}
+
+		} else if (mode == MODE_QUEUE) {
+			if (ch == '\n' || ch == KEY_ENTER || ch == key_play) {
+				play_selected();
+				visual = 0;
+			} else if (ch == key_del) {
+				if (visual) {
+					int lo = vsel_min(), hi = vsel_max(), j;
+					for (j = hi; j >= lo; j--)
+						queue_del(j);
+					visual = 0;
+				} else {
+					queue_del(sel);
+				}
+			} else if (ch == key_clear) {
+				snprintf(confirm_msg, sizeof(confirm_msg),
+				    "clear queue (%d tracks)?", nqueue);
+				confirm_action = do_queue_clear;
+				confirm_ret = MODE_QUEUE;
+				mode = MODE_CONFIRM;
+				visual = 0;
+			} else if (ch == key_move_up) {
+				if (sel > 0) {
+					queue_move(sel, sel - 1);
+					sel--;
+					scroll_into_view(&qscroll);
+				}
+			} else if (ch == key_move_dn) {
+				if (sel < nqueue - 1) {
+					queue_move(sel, sel + 1);
+					sel++;
+					scroll_into_view(&qscroll);
+				}
+			} else if (ch == key_shuffle) {
+				queue_shuffle();
+				visual = 0;
+			} else if (ch == key_plsave) {
+				if (nqueue > 0) {
+					input_len = 0;
+					input_buf[0] = '\0';
+					mode = MODE_PLSAVE;
+				}
+			} else if (ch == key_addtopl) {
+				if (nplaylists > 0) {
+					if (visual) {
+						int lo = vsel_min(), hi = vsel_max(), j;
+						npladd = 0;
+						for (j = lo; j <= hi && j < nqueue; j++)
+							pladd_tracks[npladd++] = queue[j];
+					} else if (sel >= 0 && sel < nqueue) {
+						npladd = 1;
+						pladd_tracks[0] = queue[sel];
+					}
+					if (npladd > 0) {
+						pl_scan();
+						pladd_ret = MODE_QUEUE;
+						mode = MODE_PLADD;
+						sel = 0;
+					}
+				}
+			} else if (ch == key_quit || ch == 27) {
+				mode = MODE_BROWSE;
+				sel = 0;
+				visual = 0;
+			}
+
+		} else if (mode == MODE_LIBRARY) {
+			if (ch == '\n' || ch == KEY_ENTER || ch == key_play) {
+				play_selected();
+				visual = 0;
+			} else if (ch == key_queue) {
+				if (visual) {
+					int lo = vsel_min(), hi = vsel_max(), j;
+					for (j = lo; j <= hi && j < nlib; j++)
+						queue_add(&library[j]);
+					visual = 0;
+				} else if (sel >= 0 && sel < nlib) {
+					queue_add(&library[sel]);
+				}
+			} else if (ch == key_del) {
+				if (sel >= 0 && sel < nlib) {
+					snprintf(confirm_msg, sizeof(confirm_msg),
+					    "delete '%s' from library?", library[sel].title);
+					confirm_arg = sel;
+					confirm_action = do_lib_delete;
+					confirm_ret = MODE_LIBRARY;
+					mode = MODE_CONFIRM;
+				}
+			} else if (ch == key_addtopl) {
+				if (nplaylists > 0) {
+					if (visual) {
+						int lo = vsel_min(), hi = vsel_max(), j;
+						npladd = 0;
+						for (j = lo; j <= hi && j < nlib; j++)
+							pladd_tracks[npladd++] = library[j];
+					} else if (sel >= 0 && sel < nlib) {
+						npladd = 1;
+						pladd_tracks[0] = library[sel];
+					}
+					if (npladd > 0) {
+						pl_scan();
+						pladd_ret = MODE_LIBRARY;
+						mode = MODE_PLADD;
+						sel = 0;
+					}
+				}
+			} else if (ch == key_quit || ch == 27) {
+				mode = MODE_BROWSE;
+				sel = 0;
+				visual = 0;
+			}
+
+		} else {
+			/* MODE_BROWSE */
+			if (ch == key_quit) {
+				break;
+			} else if (ch == '\n' || ch == KEY_ENTER || ch == key_play) {
+				play_selected();
+				visual = 0;
+			} else if (ch == key_queue) {
+				if (visual) {
+					int lo = vsel_min(), hi = vsel_max(), j;
+					for (j = lo; j <= hi && j < nresults; j++)
+						queue_add(&results[j]);
+					visual = 0;
+				} else if (sel >= 0 && sel < nresults) {
+					queue_add(&results[sel]);
+				}
+			} else if (ch == key_addtopl) {
+				if (nplaylists > 0 && nresults > 0) {
+					if (visual) {
+						int lo = vsel_min(), hi = vsel_max(), j;
+						npladd = 0;
+						for (j = lo; j <= hi && j < nresults; j++)
+							pladd_tracks[npladd++] = results[j];
+					} else if (sel >= 0 && sel < nresults) {
+						npladd = 1;
+						pladd_tracks[0] = results[sel];
+					}
+					if (npladd > 0) {
+						pl_scan();
+						pladd_ret = MODE_BROWSE;
+						mode = MODE_PLADD;
+						sel = 0;
+					}
+				}
+			} else if (ch == key_qview) {
+				mode = MODE_QUEUE;
+				sel = qpos >= 0 ? qpos : 0;
+				qscroll = 0;
+				visual = 0;
+			} else if (ch == key_lib) {
+				mode = MODE_LIBRARY;
+				lib_scan();
+				sel = 0;
+				libscroll = 0;
+				visual = 0;
+			} else if (ch == '?') {
+				mode = MODE_HELP;
+				visual = 0;
+			} else if (ch == 27) {
+				int next = getch();
+				if (next == '/') {
+					mode = MODE_SEARCH;
+					qlen = 0;
+					query[0] = '\0';
+					visual = 0;
+				} else if (next == 'p') {
+					mode = MODE_PLAYLIST;
+					pl_scan();
+					pl_level = 0;
+					sel = 0;
+					plscroll = 0;
+					visual = 0;
+				} else if (next != ERR) {
+					ungetch(next);
+				}
+			}
+		}
+
+		draw();
+	}
+	return 0;
+}
