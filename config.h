@@ -40,3 +40,28 @@ static const int vol_step = 5;
 
 /* library path (~ is expanded) */
 static const char *lib_dir = "~/Music/hum";
+
+/*
+ * colors - uses ncurses COLOR_* constants:
+ *   COLOR_BLACK, COLOR_RED, COLOR_GREEN, COLOR_YELLOW,
+ *   COLOR_BLUE, COLOR_MAGENTA, COLOR_CYAN, COLOR_WHITE
+ *   -1 = terminal default
+ */
+static const int col_header_fg  = COLOR_BLUE;     /* section headers */
+static const int col_header_bg  = -1;
+static const int col_num_fg     = COLOR_YELLOW;    /* line numbers */
+static const int col_num_bg     = -1;
+static const int col_playing_fg = COLOR_GREEN;     /* >> and playing number */
+static const int col_playing_bg = -1;
+static const int col_visual_fg  = COLOR_WHITE;     /* visual selection */
+static const int col_visual_bg  = COLOR_BLUE;
+static const int col_status_fg  = COLOR_WHITE;     /* status bar */
+static const int col_status_bg  = -1;
+static const int col_bar_fg     = COLOR_GREEN;     /* progress bar filled */
+static const int col_bar_bg     = -1;
+static const int col_search_fg  = COLOR_CYAN;      /* search prompt / */
+static const int col_search_bg  = -1;
+static const int col_mode_fg    = COLOR_YELLOW;    /* mode indicators */
+static const int col_mode_bg    = -1;
+static const int col_dim_fg     = COLOR_BLACK;     /* dim text (bright black = gray) */
+static const int col_dim_bg     = -1;
