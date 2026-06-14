@@ -456,23 +456,35 @@ lib_download(const char *url, const char *title)
 	}
 }
 
-/* ---- search ---- */
+/* ---- search (non-blocking) ---- */
+
+static pid_t search_pid = -1;
+static int search_fd = -1;
+static char search_buf[4096];
+static int search_buf_len;
+static int searching;
 
 static void
-do_search(const char *q)
+search_start(const char *q)
 {
 	int pipefd[2];
-	pid_t pid;
 	char arg[MAX_QUERY + 16];
-	char line[MAX_TITLE + MAX_URL];
-	FILE *fp;
+
+	/* cancel any running search */
+	if (search_pid > 0) {
+		kill(search_pid, SIGTERM);
+		waitpid(search_pid, NULL, 0);
+		close(search_fd);
+		search_pid = -1;
+		search_fd = -1;
+	}
 
 	if (pipe(pipefd) < 0)
 		return;
 	snprintf(arg, sizeof(arg), "ytsearch%d:%s", search_count, q);
 
-	pid = fork();
-	if (pid == 0) {
+	search_pid = fork();
+	if (search_pid == 0) {
 		close(pipefd[0]);
 		dup2(pipefd[1], STDOUT_FILENO);
 		close(pipefd[1]);
@@ -483,29 +495,81 @@ do_search(const char *q)
 	}
 	close(pipefd[1]);
 
-	fp = fdopen(pipefd[0], "r");
-	if (!fp) {
-		close(pipefd[0]);
-		waitpid(pid, NULL, 0);
+	/* make read end non-blocking */
+	fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
+	search_fd = pipefd[0];
+	search_buf_len = 0;
+	search_buf[0] = '\0';
+	nresults = 0;
+	searching = 1;
+}
+
+static void
+search_poll(void)
+{
+	char tmp[1024];
+	ssize_t n;
+	char *line, *next;
+
+	if (search_fd < 0)
 		return;
+
+	/* read whatever is available */
+	n = read(search_fd, tmp, sizeof(tmp) - 1);
+	if (n > 0) {
+		/* append to buffer */
+		if (search_buf_len + n >= (int)sizeof(search_buf))
+			n = sizeof(search_buf) - search_buf_len - 1;
+		memcpy(search_buf + search_buf_len, tmp, n);
+		search_buf_len += n;
+		search_buf[search_buf_len] = '\0';
+
+		/* parse complete lines */
+		line = search_buf;
+		while ((next = strchr(line, '\n')) && nresults < MAX_RESULTS) {
+			*next = '\0';
+			char *tab = strchr(line, '\t');
+			if (tab) {
+				*tab = '\0';
+				tab++;
+				snprintf(results[nresults].title, MAX_TITLE, "%s", line);
+				snprintf(results[nresults].url, MAX_URL,
+				    "https://www.youtube.com/watch?v=%s", tab);
+				nresults++;
+			}
+			line = next + 1;
+		}
+		/* move remaining partial line to start of buffer */
+		if (line != search_buf) {
+			search_buf_len = strlen(line);
+			memmove(search_buf, line, search_buf_len + 1);
+		}
 	}
 
-	nresults = 0;
-	while (fgets(line, sizeof(line), fp) && nresults < MAX_RESULTS) {
-		char *tab = strchr(line, '\t');
-		if (!tab)
-			continue;
-		*tab = '\0';
-		tab++;
-		tab[strcspn(tab, "\n")] = '\0';
-		snprintf(results[nresults].title, MAX_TITLE, "%s", line);
-		snprintf(results[nresults].url, MAX_URL,
-		    "https://www.youtube.com/watch?v=%s", tab);
-		nresults++;
+	/* check if process exited */
+	if (search_pid > 0 && waitpid(search_pid, NULL, WNOHANG) > 0) {
+		close(search_fd);
+		search_pid = -1;
+		search_fd = -1;
+		searching = 0;
+		sel = 0;
+		rscroll = 0;
+		if (nresults == 0)
+			status_set("no results");
 	}
-	fclose(fp);
-	waitpid(pid, NULL, 0);
-	sel = 0;
+}
+
+static void
+search_cancel(void)
+{
+	if (search_pid > 0) {
+		kill(search_pid, SIGTERM);
+		waitpid(search_pid, NULL, 0);
+		close(search_fd);
+		search_pid = -1;
+		search_fd = -1;
+	}
+	searching = 0;
 }
 
 /* ---- queue helpers ---- */
@@ -659,6 +723,7 @@ play_selected(void)
 static void
 cleanup(void)
 {
+	search_cancel();
 	mpv_stop();
 	endwin();
 }
@@ -938,7 +1003,9 @@ draw(void)
 			}
 		}
 
-		if (nresults == 0 && query[0] && mode == MODE_BROWSE)
+		if (searching)
+			mvprintw(2, 0, " searching...");
+		else if (nresults == 0 && query[0] && mode == MODE_BROWSE)
 			mvprintw(2, 0, " no results");
 	}
 
@@ -1141,6 +1208,7 @@ main(int argc, char *argv[])
 			}
 			waitpid(-1, NULL, WNOHANG);
 			mpv_get_progress();
+			search_poll();
 			if (status_ticks > 0) status_ticks--;
 			draw();
 			continue;
@@ -1152,11 +1220,7 @@ main(int argc, char *argv[])
 			int r = handle_text_input(ch, query, &qlen, MAX_QUERY);
 			if (r == 1 && qlen > 0) {
 				mode = MODE_BROWSE;
-				erase();
-				mvprintw(0, 0, " searching...");
-				refresh();
-				do_search(query);
-				rscroll = 0;
+				search_start(query);
 			} else if (r == -1) {
 				mode = MODE_BROWSE;
 			}
@@ -1647,6 +1711,7 @@ main(int argc, char *argv[])
 			} else if (ch == 27) {
 				int next = getch();
 				if (next == '/') {
+					search_cancel();
 					mode = MODE_SEARCH;
 					qlen = 0;
 					query[0] = '\0';
