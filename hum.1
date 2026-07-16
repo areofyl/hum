@@ -3,6 +3,10 @@
 hum \- a minimal TUI music player
 .SH SYNOPSIS
 .B hum
+.RB [ \-p | \-\-playlists ]
+.RB [ \-b | \-\-browse ]
+.RB [ \-s | \-\-search ]
+.RB [ \-q | \-\-queue ]
 .RB [ \-h | \-\-help ]
 .SH DESCRIPTION
 .B hum
@@ -10,8 +14,25 @@ is a terminal music player that searches YouTube, plays audio with mpv,
 and automatically downloads tracks to a local library.
 It works offline once you have music saved locally.
 .PP
-On first launch, hum opens the playlists view if any exist.
-Otherwise it starts with an empty search prompt.
+On launch, hum shows a home screen with options to open playlists,
+browse the library, search YouTube, or view the queue.
+Use the flags above to skip the home screen and jump directly to a view.
+.SH OPTIONS
+.TP
+.BR \-p ", " \-\-playlists
+Open the playlists view.
+.TP
+.BR \-b ", " \-\-browse
+Browse the local library.
+.TP
+.BR \-s ", " \-\-search
+Open the YouTube search prompt.
+.TP
+.BR \-q ", " \-\-queue
+View the playback queue.
+.TP
+.BR \-h ", " \-\-help
+Print a help summary and exit.
 .SH KEYS
 .SS Navigation
 .TP
@@ -34,14 +55,15 @@ View the queue.
 Browse the local library.
 .TP
 .B q
-Go back, or quit from the main view.
+Go back to the home screen, or quit from the home screen.
 .TP
 .B ?
 Show the in-app help page.
 .SS Playback
 .TP
 .B l, Enter
-Play the selected track.
+Play the selected track. Selecting a playlist result expands it
+to show its individual tracks.
 .TP
 .B Space
 Pause or resume.
@@ -89,6 +111,7 @@ Save the current queue as a playlist.
 .TP
 .B l, Enter
 Enter a playlist, or play a track inside one.
+Entering a playlist loads all its tracks into the queue.
 .TP
 .B h
 Go back one level.
@@ -101,6 +124,25 @@ Delete a playlist or a track from a playlist.
 .TP
 .B R
 Rename a playlist.
+.SS Search results
+.TP
+.B s / p
+Search results are marked with
+.B s
+(song) or
+.B p
+(playlist) on the left.
+.TP
+.B Enter on a playlist result
+Expands the playlist to show its individual tracks.
+.TP
+.B D
+Batch download all displayed results. Prompts for a playlist name,
+then lets you name each track before downloading.
+.TP
+.B >> download all
+Appears at the bottom of an expanded playlist.
+Select it and press Enter to batch download all tracks.
 .SS Visual mode
 .TP
 .B V
@@ -108,18 +150,32 @@ Toggle visual selection. Use j/k to extend the selection,
 then press a, A, or d to act on all selected tracks.
 .SH FILES
 .TP
-.I ~/Music/hum/
-Default library directory. Downloaded tracks are saved here.
+.I ~/Music/
+Default library directory. Downloaded tracks are saved here as opus files.
 Can be changed in config.h.
 .TP
-.I ~/Music/hum/playlists/
+.I ~/Music/playlists/
 Playlists are stored as plain text files with a .hum extension.
-Each line is a tab-separated title and path/URL pair.
+Each line is a tab-separated title and URL pair.
 .SH CONFIGURATION
 All configuration is done by editing
 .B config.h
-and rebuilding. This includes keybinds, colors, library path,
-search result count, volume step, and seek step.
+and rebuilding. This includes:
+.PP
+.RS
+.IP \(bu 2
+All keybinds
+.IP \(bu 2
+All colors (headers, line numbers, playing indicator, visual selection,
+search bar, progress bar, home screen title/subtitle/keys/selection,
+song and playlist markers, and more)
+.IP \(bu 2
+Library path
+.IP \(bu 2
+Search result count (songs and playlists separately)
+.IP \(bu 2
+Volume step and seek step
+.RE
 .PP
 Build options (compiler, flags, install prefix) live in
 .BR config.mk .
