@@ -24,12 +24,13 @@ static char sock_path[128];
 typedef struct {
 	char title[MAX_TITLE];
 	char url[MAX_URL];
+	int is_playlist;
 } Track;
 
 enum {
-	MODE_SEARCH, MODE_BROWSE, MODE_QUEUE, MODE_LIBRARY,
+	MODE_HOME, MODE_SEARCH, MODE_BROWSE, MODE_QUEUE, MODE_LIBRARY,
 	MODE_PLAYLIST, MODE_PLSAVE, MODE_PLRENAME, MODE_PLADD, MODE_HELP,
-	MODE_CONFIRM
+	MODE_CONFIRM, MODE_DLNAME, MODE_BATCHNAME
 };
 
 enum { REP_OFF, REP_ONE, REP_ALL };
@@ -60,6 +61,7 @@ static int pl_cur;
 static char input_buf[128];
 static int input_len;
 static int repeat_mode = REP_OFF;
+static int home_sel;
 
 /* visual mode */
 static int visual;
@@ -73,6 +75,18 @@ static int pladd_scroll;
 
 /* rename state */
 static int plrename_idx;
+
+/* download name state */
+static char dl_url[MAX_URL];
+static char dl_default[MAX_TITLE];
+static int dl_retmode;
+
+/* batch download state */
+static Track dl_batch[500];
+static char dl_names[500][MAX_TITLE];
+static int dl_batch_count;
+static int dl_batch_idx;
+static char dl_batch_plname[128];
 
 /* status flash message */
 static char status_msg[128];
@@ -437,14 +451,14 @@ mpv_play(const char *url, const char *title)
 }
 
 static void
-lib_download(const char *url, const char *title)
+lib_download(const char *url, const char *name)
 {
 	pid_t pid;
 	char out[2048];
 
-	if (lib_has(title))
+	if (lib_has(name))
 		return;
-	snprintf(out, sizeof(out), "%s/%%(title)s.%%(ext)s", libpath);
+	snprintf(out, sizeof(out), "%s/%s.%%(ext)s", libpath, name);
 	pid = fork();
 	if (pid == 0) {
 		close(STDIN_FILENO);
@@ -456,32 +470,60 @@ lib_download(const char *url, const char *title)
 	}
 }
 
-/* ---- search (non-blocking) ---- */
+/* ---- search (non-blocking, songs + playlists) ---- */
 
 static pid_t search_pid = -1;
 static int search_fd = -1;
 static char search_buf[4096];
 static int search_buf_len;
+
+static pid_t search_pid_pl = -1;
+static int search_fd_pl = -1;
+static char search_buf_pl[4096];
+static int search_buf_pl_len;
+
 static int searching;
+static int search_is_url; /* 1 if query was a URL or expanded playlist */
+static int npl_results;
+
+static void
+search_kill(pid_t *pid, int *fd)
+{
+	if (*pid > 0) {
+		kill(*pid, SIGTERM);
+		waitpid(*pid, NULL, 0);
+		close(*fd);
+		*pid = -1;
+		*fd = -1;
+	}
+}
 
 static void
 search_start(const char *q)
 {
 	int pipefd[2];
-	char arg[MAX_QUERY + 16];
+	char arg[MAX_QUERY + 128];
+	char plend[16], plend_pl[16];
 
-	/* cancel any running search */
-	if (search_pid > 0) {
-		kill(search_pid, SIGTERM);
-		waitpid(search_pid, NULL, 0);
-		close(search_fd);
-		search_pid = -1;
-		search_fd = -1;
-	}
+	search_kill(&search_pid, &search_fd);
+	search_kill(&search_pid_pl, &search_fd_pl);
 
+	memset(results, 0, sizeof(results));
+	nresults = 0;
+	npl_results = 0;
+	searching = 1;
+	search_is_url = (strncmp(q, "http", 4) == 0);
+
+	snprintf(plend, sizeof(plend), "%d", MAX_RESULTS);
+	snprintf(plend_pl, sizeof(plend_pl), "%d", search_pl_count);
+
+	/* song search */
 	if (pipe(pipefd) < 0)
 		return;
-	snprintf(arg, sizeof(arg), "ytsearch%d:%s", search_count, q);
+	if (search_is_url)
+		snprintf(arg, sizeof(arg), "%s", q);
+	else
+		snprintf(arg, sizeof(arg), "ytsearch%d:%s", search_count, q);
 
 	search_pid = fork();
 	if (search_pid == 0) {
@@ -489,68 +531,153 @@ search_start(const char *q)
 		dup2(pipefd[1], STDOUT_FILENO);
 		close(pipefd[1]);
 		close(STDERR_FILENO);
+		setenv("PYTHONUNBUFFERED", "1", 1);
 		execlp("yt-dlp", "yt-dlp", "--flat-playlist",
+		    "--playlist-end", plend,
 		    "--print", "%(title)s\t%(id)s", arg, NULL);
 		_exit(1);
 	}
 	close(pipefd[1]);
-
-	/* make read end non-blocking */
 	fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
 	search_fd = pipefd[0];
 	search_buf_len = 0;
 	search_buf[0] = '\0';
-	nresults = 0;
-	searching = 1;
+
+	/* playlist search (only for text queries) */
+	if (!search_is_url) {
+		char plurl[MAX_QUERY + 128];
+		char encoded[MAX_QUERY * 3];
+		int ei = 0;
+		const char *p;
+
+		/* url-encode query */
+		for (p = q; *p && ei < (int)sizeof(encoded) - 4; p++) {
+			if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+			    (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.') {
+				encoded[ei++] = *p;
+			} else if (*p == ' ') {
+				encoded[ei++] = '+';
+			} else {
+				snprintf(encoded + ei, 4, "%%%02X", (unsigned char)*p);
+				ei += 3;
+			}
+		}
+		encoded[ei] = '\0';
+		snprintf(plurl, sizeof(plurl),
+		    "https://www.youtube.com/results?search_query=%s&sp=EgIQAw%%3D%%3D",
+		    encoded);
+
+		if (pipe(pipefd) < 0)
+			return;
+		search_pid_pl = fork();
+		if (search_pid_pl == 0) {
+			close(pipefd[0]);
+			dup2(pipefd[1], STDOUT_FILENO);
+			close(pipefd[1]);
+			close(STDERR_FILENO);
+			setenv("PYTHONUNBUFFERED", "1", 1);
+			execlp("yt-dlp", "yt-dlp", "--flat-playlist",
+			    "--playlist-end", plend_pl,
+			    "--print", "%(title)s\t%(id)s", plurl, NULL);
+			_exit(1);
+		}
+		close(pipefd[1]);
+		fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
+		search_fd_pl = pipefd[0];
+		search_buf_pl_len = 0;
+		search_buf_pl[0] = '\0';
+	}
+}
+
+/* returns 1 on EOF (child closed pipe) */
+static int
+search_read_fd(int fd, char *buf, int *buf_len, int bufsize, int is_pl)
+{
+	char tmp[1024];
+	ssize_t n;
+	char *line, *next;
+	int got_eof = 0;
+
+	/* drain all available data from non-blocking fd */
+	while ((n = read(fd, tmp, sizeof(tmp) - 1)) > 0) {
+		if (*buf_len + n >= bufsize)
+			n = bufsize - *buf_len - 1;
+		if (n <= 0)
+			break;
+		memcpy(buf + *buf_len, tmp, n);
+		*buf_len += n;
+		buf[*buf_len] = '\0';
+	}
+	if (n == 0)
+		got_eof = 1;
+
+	line = buf;
+	while ((next = strchr(line, '\n')) && nresults < MAX_RESULTS) {
+		*next = '\0';
+		char *tab = strchr(line, '\t');
+		if (tab) {
+			if (is_pl && npl_results >= search_pl_count) {
+				line = next + 1;
+				continue;
+			}
+			*tab = '\0';
+			tab++;
+			snprintf(results[nresults].title, MAX_TITLE, "%s", line);
+			if (is_pl)
+				snprintf(results[nresults].url, MAX_URL,
+				    "https://www.youtube.com/playlist?list=%s", tab);
+			else
+				snprintf(results[nresults].url, MAX_URL,
+				    "https://www.youtube.com/watch?v=%s", tab);
+			results[nresults].is_playlist = is_pl;
+			nresults++;
+			if (is_pl) npl_results++;
+		}
+		line = next + 1;
+	}
+	if (line != buf) {
+		*buf_len = strlen(line);
+		memmove(buf, line, *buf_len + 1);
+	}
+	return got_eof;
 }
 
 static void
 search_poll(void)
 {
-	char tmp[1024];
-	ssize_t n;
-	char *line, *next;
+	int done = 1;
 
-	if (search_fd < 0)
-		return;
-
-	/* read whatever is available */
-	n = read(search_fd, tmp, sizeof(tmp) - 1);
-	if (n > 0) {
-		/* append to buffer */
-		if (search_buf_len + n >= (int)sizeof(search_buf))
-			n = sizeof(search_buf) - search_buf_len - 1;
-		memcpy(search_buf + search_buf_len, tmp, n);
-		search_buf_len += n;
-		search_buf[search_buf_len] = '\0';
-
-		/* parse complete lines */
-		line = search_buf;
-		while ((next = strchr(line, '\n')) && nresults < MAX_RESULTS) {
-			*next = '\0';
-			char *tab = strchr(line, '\t');
-			if (tab) {
-				*tab = '\0';
-				tab++;
-				snprintf(results[nresults].title, MAX_TITLE, "%s", line);
-				snprintf(results[nresults].url, MAX_URL,
-				    "https://www.youtube.com/watch?v=%s", tab);
-				nresults++;
+	if (search_fd >= 0) {
+		int eof = search_read_fd(search_fd, search_buf,
+		    &search_buf_len, sizeof(search_buf), 0);
+		if (eof) {
+			close(search_fd);
+			search_fd = -1;
+			if (search_pid > 0) {
+				waitpid(search_pid, NULL, WNOHANG);
+				search_pid = -1;
 			}
-			line = next + 1;
-		}
-		/* move remaining partial line to start of buffer */
-		if (line != search_buf) {
-			search_buf_len = strlen(line);
-			memmove(search_buf, line, search_buf_len + 1);
+		} else {
+			done = 0;
 		}
 	}
 
-	/* check if process exited */
-	if (search_pid > 0 && waitpid(search_pid, NULL, WNOHANG) > 0) {
-		close(search_fd);
-		search_pid = -1;
-		search_fd = -1;
+	if (search_fd_pl >= 0) {
+		int eof = search_read_fd(search_fd_pl, search_buf_pl,
+		    &search_buf_pl_len, sizeof(search_buf_pl), 1);
+		if (eof) {
+			close(search_fd_pl);
+			search_fd_pl = -1;
+			if (search_pid_pl > 0) {
+				waitpid(search_pid_pl, NULL, WNOHANG);
+				search_pid_pl = -1;
+			}
+		} else {
+			done = 0;
+		}
+	}
+
+	if (done && searching) {
 		searching = 0;
 		sel = 0;
 		rscroll = 0;
@@ -562,13 +689,8 @@ search_poll(void)
 static void
 search_cancel(void)
 {
-	if (search_pid > 0) {
-		kill(search_pid, SIGTERM);
-		waitpid(search_pid, NULL, 0);
-		close(search_fd);
-		search_pid = -1;
-		search_fd = -1;
-	}
+	search_kill(&search_pid, &search_fd);
+	search_kill(&search_pid_pl, &search_fd_pl);
 	searching = 0;
 }
 
@@ -711,13 +833,26 @@ play_selected(void)
 	}
 	if (sel < 0 || sel >= nresults)
 		return;
+	/* if it's a playlist, expand it */
+	if (results[sel].is_playlist) {
+		char expand_url[MAX_URL];
+		snprintf(expand_url, sizeof(expand_url), "%s", results[sel].url);
+		search_start(expand_url);
+		return;
+	}
 	queue_add(&results[sel]);
-	lib_download(results[sel].url, results[sel].title);
 	if (mpv_pid <= 0 || waitpid(mpv_pid, NULL, WNOHANG) > 0) {
 		mpv_pid = -1;
 		qpos = nqueue - 1;
 		mpv_play(results[sel].url, results[sel].title);
 	}
+	/* prompt for download name */
+	snprintf(dl_url, MAX_URL, "%s", results[sel].url);
+	snprintf(dl_default, MAX_TITLE, "%s", results[sel].title);
+	snprintf(input_buf, sizeof(input_buf), "%s", results[sel].title);
+	input_len = strlen(input_buf);
+	dl_retmode = MODE_BROWSE;
+	mode = MODE_DLNAME;
 }
 
 static void
@@ -759,7 +894,7 @@ list_len(void)
 	if (mode == MODE_PLAYLIST)
 		return pl_level == 0 ? nplaylists : npl_tracks;
 	if (mode == MODE_PLADD) return nplaylists;
-	return nresults;
+	return nresults + (search_is_url && nresults > 0 && !searching ? 1 : 0);
 }
 
 /* ---- colors (vim default) ---- */
@@ -772,6 +907,12 @@ list_len(void)
 #define C_SEARCH  7
 #define C_MODE    8
 #define C_DIM     9
+#define C_PLMARK  10
+#define C_SMARK   11
+#define C_HTITLE  12
+#define C_HSUB    13
+#define C_HKEY    14
+#define C_HSEL    15
 
 /* ---- draw ---- */
 
@@ -785,7 +926,56 @@ draw(void)
 	visible = rows - 5;
 	if (visible < 1) visible = 1;
 
-	if (mode == MODE_HELP) {
+	if (mode == MODE_HOME) {
+		int cy = rows / 2 - 5;
+		if (cy < 1) cy = 1;
+		int mx = (cols - 24) / 2;
+		if (mx < 2) mx = 2;
+		int mw = 24;
+
+		attron(A_BOLD | COLOR_PAIR(C_HTITLE));
+		mvprintw(cy, (cols - 3) / 2, "hum");
+		attroff(A_BOLD | COLOR_PAIR(C_HTITLE));
+
+		attron(COLOR_PAIR(C_HSUB));
+		mvprintw(cy + 1, (cols - 10) / 2, "by areofyl");
+		attroff(COLOR_PAIR(C_HSUB));
+
+		static const char keys[]    = { 'p', 'b', '/', 'v' };
+		static const char *labels[] = {
+			"playlists", "browse library",
+			"search youtube", "queue",
+		};
+
+		int i;
+		for (i = 0; i < 4; i++) {
+			int y = cy + 4 + i * 2;
+			mvprintw(y, mx, " ");
+			if (sel == i) {
+				attron(A_BOLD | COLOR_PAIR(C_HSEL));
+				printw("  %c    %-*s", keys[i], mw - 7, labels[i]);
+				attroff(A_BOLD | COLOR_PAIR(C_HSEL));
+			} else {
+				printw("  ");
+				attron(A_BOLD | COLOR_PAIR(C_HKEY));
+				printw("%c", keys[i]);
+				attroff(A_BOLD | COLOR_PAIR(C_HKEY));
+				printw("    ");
+				printw("%-*s", mw - 7, labels[i]);
+			}
+		}
+
+		mvprintw(cy + 13, mx, "  ");
+		attron(A_BOLD | COLOR_PAIR(C_HKEY));
+		printw("?");
+		attroff(A_BOLD | COLOR_PAIR(C_HKEY));
+		printw("  help    ");
+		attron(A_BOLD | COLOR_PAIR(C_HKEY));
+		printw("q");
+		attroff(A_BOLD | COLOR_PAIR(C_HKEY));
+		printw("  quit");
+
+	} else if (mode == MODE_HELP) {
 		int y = 0;
 		attron(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(y++, 0, " hum - help");
@@ -834,6 +1024,7 @@ draw(void)
 		mvprintw(y++, 0, "   A            add selected to playlist");
 		mvprintw(y++, 0, "   d            delete playlist / track");
 		mvprintw(y++, 0, "   R            rename playlist");
+		mvprintw(y++, 0, "   D            download all results (batch)");
 		y++;
 		attron(A_BOLD | COLOR_PAIR(C_HEADER));
 		mvprintw(y++, 0, " visual mode");
@@ -972,6 +1163,24 @@ draw(void)
 		attroff(A_BOLD | COLOR_PAIR(C_HEADER));
 		printw(" %s_", input_buf);
 
+	} else if (mode == MODE_BATCHNAME) {
+		attron(A_BOLD | COLOR_PAIR(C_HEADER));
+		mvprintw(0, 0, " playlist name:");
+		attroff(A_BOLD | COLOR_PAIR(C_HEADER));
+		printw(" %s_", input_buf);
+
+	} else if (mode == MODE_DLNAME) {
+		if (dl_batch_count > 0) {
+			attron(A_BOLD | COLOR_PAIR(C_HEADER));
+			mvprintw(0, 0, " save as (%d/%d):", dl_batch_idx + 1, dl_batch_count);
+			attroff(A_BOLD | COLOR_PAIR(C_HEADER));
+		} else {
+			attron(A_BOLD | COLOR_PAIR(C_HEADER));
+			mvprintw(0, 0, " save as:");
+			attroff(A_BOLD | COLOR_PAIR(C_HEADER));
+		}
+		printw(" %s_", input_buf);
+
 	} else {
 		/* search bar */
 		attron(A_BOLD | COLOR_PAIR(C_SEARCH));
@@ -990,22 +1199,36 @@ draw(void)
 			attron(COLOR_PAIR(playing ? C_PLAYING : C_NUM));
 			printw("%2d", idx + 1);
 			attroff(COLOR_PAIR(playing ? C_PLAYING : C_NUM));
-			printw("  ");
+			attron(COLOR_PAIR(results[idx].is_playlist ? C_PLMARK : C_SMARK) | A_BOLD);
+			printw(" %c ", results[idx].is_playlist ? 'p' : 's');
+			attroff(COLOR_PAIR(results[idx].is_playlist ? C_PLMARK : C_SMARK) | A_BOLD);
 			if (selected && visual) attron(COLOR_PAIR(C_VISUAL));
 			else if (selected) attron(A_REVERSE);
-			printw("%.*s", cols - 10, results[idx].title);
+			printw("%.*s", cols - 12, results[idx].title);
 			if (selected && visual) attroff(COLOR_PAIR(C_VISUAL));
 			else if (selected) attroff(A_REVERSE);
-			if (lib_has(results[idx].title)) {
+			if (!results[idx].is_playlist && lib_has(results[idx].title)) {
 				attron(COLOR_PAIR(C_DIM) | A_BOLD);
 				printw(" *");
 				attroff(COLOR_PAIR(C_DIM) | A_BOLD);
 			}
 		}
 
-		if (searching)
+		/* "download all" button for expanded playlists */
+		if (search_is_url && nresults > 0 && !searching &&
+		    i + rscroll >= nresults && i + 2 < rows - 2) {
+			if (sel == nresults && mode == MODE_BROWSE)
+				attron(A_REVERSE);
+			attron(COLOR_PAIR(C_PLAYING));
+			mvprintw(i + 3, 0, "     >> download all (%d tracks)", nresults);
+			attroff(COLOR_PAIR(C_PLAYING));
+			if (sel == nresults && mode == MODE_BROWSE)
+				attroff(A_REVERSE);
+		}
+
+		if (searching && nresults == 0)
 			mvprintw(2, 0, " searching...");
-		else if (nresults == 0 && query[0] && mode == MODE_BROWSE)
+		else if (nresults == 0 && query[0] && mode == MODE_BROWSE && !searching)
 			mvprintw(2, 0, " no results");
 	}
 
@@ -1132,26 +1355,45 @@ int
 main(int argc, char *argv[])
 {
 	int ch;
+	int start_mode = MODE_HOME;
 
-	if (argc > 1 && (strcmp(argv[1], "--help") == 0 ||
-	    strcmp(argv[1], "-h") == 0)) {
-		printf("hum - a minimal TUI music player\n\n");
-		printf("usage: hum [--help]\n\n");
-		printf("keys:\n");
-		printf("  j/k         move down/up\n");
-		printf("  l/Enter     play selected\n");
-		printf("  Space       pause/resume\n");
-		printf("  n/p         next/previous track\n");
-		printf("  Esc /       search YouTube\n");
-		printf("  Esc p       open playlists\n");
-		printf("  v           view queue\n");
-		printf("  b           browse library\n");
-		printf("  a           add to queue\n");
-		printf("  ?           help (in app)\n");
-		printf("  q           quit\n\n");
-		printf("config: edit config.h and rebuild\n");
-		printf("library: %s\n", lib_dir);
-		return 0;
+	if (argc > 1) {
+		if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+			printf("hum - a minimal TUI music player\n\n");
+			printf("usage: hum [option]\n\n");
+			printf("options:\n");
+			printf("  -p, --playlists   open playlists\n");
+			printf("  -b, --browse      browse library\n");
+			printf("  -s, --search      search youtube\n");
+			printf("  -q, --queue       view queue\n");
+			printf("  -h, --help        show this help\n\n");
+			printf("keys:\n");
+			printf("  j/k         move down/up\n");
+			printf("  l/Enter     play selected\n");
+			printf("  Space       pause/resume\n");
+			printf("  n/p         next/previous track\n");
+			printf("  Esc /       search YouTube\n");
+			printf("  Esc p       open playlists\n");
+			printf("  v           view queue\n");
+			printf("  b           browse library\n");
+			printf("  a           add to queue\n");
+			printf("  ?           help (in app)\n\n");
+			printf("config: edit config.h and rebuild\n");
+			printf("library: %s\n", lib_dir);
+			return 0;
+		} else if (strcmp(argv[1], "-p") == 0 ||
+		    strcmp(argv[1], "--playlists") == 0) {
+			start_mode = MODE_PLAYLIST;
+		} else if (strcmp(argv[1], "-b") == 0 ||
+		    strcmp(argv[1], "--browse") == 0) {
+			start_mode = MODE_LIBRARY;
+		} else if (strcmp(argv[1], "-s") == 0 ||
+		    strcmp(argv[1], "--search") == 0) {
+			start_mode = MODE_SEARCH;
+		} else if (strcmp(argv[1], "-q") == 0 ||
+		    strcmp(argv[1], "--queue") == 0) {
+			start_mode = MODE_QUEUE;
+		}
 	}
 
 	srand(time(NULL));
@@ -1181,18 +1423,30 @@ main(int argc, char *argv[])
 		init_pair(C_SEARCH,  col_search_fg,  col_search_bg);
 		init_pair(C_MODE,    col_mode_fg,    col_mode_bg);
 		init_pair(C_DIM,     col_dim_fg,     col_dim_bg);
+		init_pair(C_SMARK,   col_smark_fg,  col_smark_bg);
+		init_pair(C_HTITLE,  col_home_title_fg, col_home_title_bg);
+		init_pair(C_HSUB,    col_home_sub_fg,   col_home_sub_bg);
+		init_pair(C_HKEY,    col_home_key_fg,   col_home_key_bg);
+		init_pair(C_HSEL,    col_home_sel_fg,   col_home_sel_bg);
+		init_pair(C_PLMARK,  col_plmark_fg, col_plmark_bg);
 	}
 
 	atexit(cleanup);
 
 	pl_scan();
-	if (nplaylists > 0) {
-		mode = MODE_PLAYLIST;
+	mode = start_mode;
+	sel = 0;
+	if (mode == MODE_LIBRARY) {
+		lib_scan();
+		libscroll = 0;
+	} else if (mode == MODE_PLAYLIST) {
 		pl_level = 0;
-		sel = 0;
 		plscroll = 0;
-	} else {
-		mode = MODE_BROWSE;
+	} else if (mode == MODE_QUEUE) {
+		qscroll = 0;
+	} else if (mode == MODE_SEARCH) {
+		qlen = 0;
+		query[0] = '\0';
 	}
 	draw();
 
@@ -1241,6 +1495,81 @@ main(int argc, char *argv[])
 			continue;
 		}
 
+		if (mode == MODE_BATCHNAME) {
+			int r = handle_text_input(ch, input_buf, &input_len, 128);
+			if (r == 1 && input_len > 0) {
+				snprintf(dl_batch_plname, sizeof(dl_batch_plname), "%s", input_buf);
+				/* start naming tracks */
+				dl_batch_idx = 0;
+				snprintf(input_buf, sizeof(input_buf), "%s",
+				    dl_batch[0].title);
+				input_len = strlen(input_buf);
+				mode = MODE_DLNAME;
+			} else if (r == -1) {
+				dl_batch_count = 0;
+				mode = MODE_BROWSE;
+			}
+			draw();
+			continue;
+		}
+
+		if (mode == MODE_DLNAME) {
+			int r = handle_text_input(ch, input_buf, &input_len, 128);
+			if (dl_batch_count > 0 && (r == 1 || r == -1)) {
+				/* batch mode: Enter confirms name, Esc keeps default */
+				const char *name = (r == 1 && input_len > 0) ?
+				    input_buf : dl_batch[dl_batch_idx].title;
+
+				snprintf(dl_names[dl_batch_idx], MAX_TITLE, "%s", name);
+				snprintf(dl_batch[dl_batch_idx].title, MAX_TITLE,
+				    "%s", name);
+				lib_download(dl_batch[dl_batch_idx].url, name);
+
+				if (dl_batch_idx == 0) {
+					queue_add(&dl_batch[0]);
+					qpos = nqueue - 1;
+					mpv_play(dl_batch[0].url, dl_batch[0].title);
+				} else {
+					queue_add(&dl_batch[dl_batch_idx]);
+				}
+
+				dl_batch_idx++;
+				if (dl_batch_idx < dl_batch_count) {
+					snprintf(input_buf, sizeof(input_buf), "%s",
+					    dl_batch[dl_batch_idx].title);
+					input_len = strlen(input_buf);
+				} else {
+					char plpath[2048];
+					FILE *fp;
+					int j;
+					snprintf(plpath, sizeof(plpath), "%s/%s.hum",
+					    plspath, dl_batch_plname);
+					fp = fopen(plpath, "w");
+					if (fp) {
+						for (j = 0; j < dl_batch_count; j++)
+							fprintf(fp, "%s\t%s\n",
+							    dl_names[j],
+							    dl_batch[j].url);
+						fclose(fp);
+					}
+					status_set("playlist created");
+					dl_batch_count = 0;
+					mode = MODE_BROWSE;
+				}
+			} else if (r == 1) {
+				/* single track mode */
+				const char *name = (input_len > 0) ?
+				    input_buf : dl_default;
+				lib_download(dl_url, name);
+				status_set("downloading");
+				mode = dl_retmode;
+			} else if (r == -1) {
+				mode = dl_retmode;
+			}
+			draw();
+			continue;
+		}
+
 		if (mode == MODE_PLRENAME) {
 			int r = handle_text_input(ch, input_buf, &input_len, 128);
 			if (r == 1 && input_len > 0) {
@@ -1254,9 +1583,77 @@ main(int argc, char *argv[])
 			continue;
 		}
 
+		if (mode == MODE_HOME) {
+			int handled = 1;
+			int old_sel = sel;
+			if (ch == key_up || ch == KEY_UP) {
+				if (sel > 0) sel--;
+			} else if (ch == key_down || ch == KEY_DOWN) {
+				if (sel < 3) sel++;
+			} else if (ch == '\n' || ch == KEY_ENTER || ch == 'l') {
+				if (sel == 0) {
+					mode = MODE_PLAYLIST;
+					pl_scan();
+					pl_level = 0;
+					sel = 0;
+					plscroll = 0;
+				} else if (sel == 1) {
+					mode = MODE_LIBRARY;
+					lib_scan();
+					sel = 0;
+					libscroll = 0;
+				} else if (sel == 2) {
+					mode = MODE_SEARCH;
+					qlen = 0;
+					query[0] = '\0';
+				} else if (sel == 3) {
+					mode = MODE_QUEUE;
+					sel = qpos >= 0 ? qpos : 0;
+					qscroll = 0;
+				}
+			} else if (ch == '/' || ch == 27) {
+				int next = (ch == 27) ? getch() : '/';
+				if (next == '/') {
+					mode = MODE_SEARCH;
+					qlen = 0;
+					query[0] = '\0';
+				} else if (next == 'p') {
+					mode = MODE_PLAYLIST;
+					pl_scan();
+					pl_level = 0;
+					sel = 0;
+					plscroll = 0;
+				} else if (next != ERR) {
+					ungetch(next);
+				}
+			} else if (ch == key_lib) {
+				mode = MODE_LIBRARY;
+				lib_scan();
+				sel = 0;
+				libscroll = 0;
+			} else if (ch == key_qview) {
+				mode = MODE_QUEUE;
+				sel = qpos >= 0 ? qpos : 0;
+				qscroll = 0;
+			} else if (ch == '?') {
+				mode = MODE_HELP;
+			} else if (ch == key_quit) {
+				break;
+			} else {
+				handled = 0;
+			}
+			if (handled) {
+				if (mode != MODE_HOME)
+					home_sel = old_sel;
+				draw();
+				continue;
+			}
+			/* fall through for playback keys */
+		}
+
 		if (mode == MODE_HELP) {
-			mode = MODE_BROWSE;
-			sel = 0;
+			mode = MODE_HOME;
+			sel = home_sel;
 			visual = 0;
 			draw();
 			continue;
@@ -1535,8 +1932,8 @@ main(int argc, char *argv[])
 					sel = pl_cur;
 					plscroll = 0;
 				} else {
-					mode = MODE_BROWSE;
-					sel = 0;
+					mode = MODE_HOME;
+					sel = home_sel;
 				}
 				visual = 0;
 			}
@@ -1603,8 +2000,8 @@ main(int argc, char *argv[])
 					}
 				}
 			} else if (ch == key_quit || ch == 27) {
-				mode = MODE_BROWSE;
-				sel = 0;
+				mode = MODE_HOME;
+				sel = home_sel;
 				visual = 0;
 			}
 
@@ -1652,17 +2049,34 @@ main(int argc, char *argv[])
 					}
 				}
 			} else if (ch == key_quit || ch == 27) {
-				mode = MODE_BROWSE;
-				sel = 0;
+				mode = MODE_HOME;
+				sel = home_sel;
 				visual = 0;
 			}
 
 		} else {
 			/* MODE_BROWSE */
 			if (ch == key_quit) {
-				break;
+				mode = MODE_HOME;
+				sel = home_sel;
+				visual = 0;
 			} else if (ch == '\n' || ch == KEY_ENTER || ch == key_play) {
-				play_selected();
+				/* "download all" button */
+				if (search_is_url && sel == nresults && nresults > 0) {
+					int j;
+					dl_batch_count = 0;
+					for (j = 0; j < nresults; j++) {
+						if (!results[j].is_playlist)
+							dl_batch[dl_batch_count++] = results[j];
+					}
+					if (dl_batch_count > 0) {
+						input_len = 0;
+						input_buf[0] = '\0';
+						mode = MODE_BATCHNAME;
+					}
+				} else {
+					play_selected();
+				}
 				visual = 0;
 			} else if (ch == key_queue) {
 				if (visual) {
@@ -1692,6 +2106,20 @@ main(int argc, char *argv[])
 						mode = MODE_PLADD;
 						sel = 0;
 						pladd_scroll = 0;
+					}
+				}
+			} else if (ch == 'D') {
+				if (nresults > 0 && !searching) {
+					int j;
+					dl_batch_count = 0;
+					for (j = 0; j < nresults; j++) {
+						if (!results[j].is_playlist)
+							dl_batch[dl_batch_count++] = results[j];
+					}
+					if (dl_batch_count > 0) {
+						input_len = 0;
+						input_buf[0] = '\0';
+						mode = MODE_BATCHNAME;
 					}
 				}
 			} else if (ch == key_qview) {
@@ -1727,6 +2155,12 @@ main(int argc, char *argv[])
 					ungetch(next);
 				}
 			}
+		}
+
+		/* if browse has nothing to show and no query, go home */
+		if (mode == MODE_BROWSE && nresults == 0 && !searching && !query[0]) {
+			mode = MODE_HOME;
+			sel = home_sel;
 		}
 
 		draw();
