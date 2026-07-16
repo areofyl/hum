@@ -1,0 +1,139 @@
+.TH HUM 1 "2026-07-15" "hum" "User Commands"
+.SH NAME
+hum \- a minimal TUI music player
+.SH SYNOPSIS
+.B hum
+.RB [ \-h | \-\-help ]
+.SH DESCRIPTION
+.B hum
+is a terminal music player that searches YouTube, plays audio with mpv,
+and automatically downloads tracks to a local library.
+It works offline once you have music saved locally.
+.PP
+On first launch, hum opens the playlists view if any exist.
+Otherwise it starts with an empty search prompt.
+.SH KEYS
+.SS Navigation
+.TP
+.B j/k
+Move down/up.
+.TP
+.B g/G
+Jump to top/bottom.
+.TP
+.B Esc /
+Search YouTube.
+.TP
+.B Esc p
+Open playlists.
+.TP
+.B v
+View the queue.
+.TP
+.B b
+Browse the local library.
+.TP
+.B q
+Go back, or quit from the main view.
+.TP
+.B ?
+Show the in-app help page.
+.SS Playback
+.TP
+.B l, Enter
+Play the selected track.
+.TP
+.B Space
+Pause or resume.
+.TP
+.B n
+Next track.
+.TP
+.B p
+Previous track.
+.TP
+.B x
+Stop playback.
+.TP
+.B , .
+Seek backward/forward 5 seconds.
+.TP
+.B + \-
+Volume up/down.
+.TP
+.B m
+Mute/unmute.
+.TP
+.B r
+Cycle repeat mode (off, single, all).
+.SS Queue
+.TP
+.B a
+Add the selected track to the queue.
+.TP
+.B d
+Delete the selected track from the queue.
+.TP
+.B c
+Clear the entire queue (asks for confirmation).
+.TP
+.B J/K
+Move a track down/up in the queue.
+.TP
+.B S
+Shuffle the queue.
+.TP
+.B s
+Save the current queue as a playlist.
+.SS Playlists
+.TP
+.B l, Enter
+Enter a playlist, or play a track inside one.
+.TP
+.B h
+Go back one level.
+.TP
+.B A
+Add the selected track(s) to an existing playlist.
+.TP
+.B d
+Delete a playlist or a track from a playlist.
+.TP
+.B R
+Rename a playlist.
+.SS Visual mode
+.TP
+.B V
+Toggle visual selection. Use j/k to extend the selection,
+then press a, A, or d to act on all selected tracks.
+.SH FILES
+.TP
+.I ~/Music/hum/
+Default library directory. Downloaded tracks are saved here.
+Can be changed in config.h.
+.TP
+.I ~/Music/hum/playlists/
+Playlists are stored as plain text files with a .hum extension.
+Each line is a tab-separated title and path/URL pair.
+.SH CONFIGURATION
+All configuration is done by editing
+.B config.h
+and rebuilding. This includes keybinds, colors, library path,
+search result count, volume step, and seek step.
+.PP
+Build options (compiler, flags, install prefix) live in
+.BR config.mk .
+.SH DEPENDENCIES
+.TP
+.B mpv
+Audio playback and IPC control.
+.TP
+.B yt-dlp
+YouTube search and track downloading. Not needed if you only play local files.
+.TP
+.B ncurses
+Terminal UI.
+.SH AUTHORS
+areofyl
+.SH LICENSE
+MIT. See the LICENSE file for details.
