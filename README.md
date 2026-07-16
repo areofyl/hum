@@ -56,7 +56,11 @@ Hum uses vim-style navigation. Press `?` in the app for the full list, but here'
 
 ## Configuration
 
-Edit `config.h` and rebuild. You can change keybinds, library path, search result count, volume step, seek step, and more.
+Edit `config.h` and rebuild. You can change keybinds, colors, library path, search result count, volume step, seek step, and more.
+
+Build options (compiler, flags, install prefix) are in `config.mk`.
+
+See `man hum` after installing for the full reference.
 
 ## License
 
