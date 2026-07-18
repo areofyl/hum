@@ -1,4 +1,4 @@
-.TH HUM 1 "2026-07-15" "hum" "User Commands"
+.TH HUM 1 "2026-07-18" "hum" "User Commands"
 .SH NAME
 hum \- a minimal TUI music player
 .SH SYNOPSIS
@@ -16,6 +16,7 @@ It works offline once you have music saved locally.
 .PP
 On launch, hum shows a home screen with options to open playlists,
 browse the library, search YouTube, or view the queue.
+The home screen also shows recently played tracks.
 Use the flags above to skip the home screen and jump directly to a view.
 .SH OPTIONS
 .TP
@@ -42,11 +43,16 @@ Move down/up.
 .B g/G
 Jump to top/bottom.
 .TP
+.B /
+Filter the current list (works in all views).
+While typing a filter, all other keybinds are disabled.
+Press Enter to confirm or Esc to clear.
+.TP
 .B Esc /
-Search YouTube.
+Search YouTube (from non-browse views).
 .TP
 .B Esc p
-Open playlists.
+Open playlists (from non-browse views).
 .TP
 .B v
 View the queue.
@@ -54,8 +60,9 @@ View the queue.
 .B b
 Browse the local library.
 .TP
-.B q
-Go back to the home screen, or quit from the home screen.
+.B q, Esc
+Go back. In browse mode: clear filter, then new search, then home.
+From the home screen, q quits.
 .TP
 .B ?
 Show the in-app help page.
@@ -89,6 +96,7 @@ Mute/unmute.
 .B r
 Cycle repeat mode (off, single, all).
 .SS Queue
+The queue is persistent and saved between sessions.
 .TP
 .B a
 Add the selected track to the queue.
@@ -157,25 +165,22 @@ Can be changed in config.h.
 .I ~/Music/playlists/
 Playlists are stored as plain text files with a .hum extension.
 Each line is a tab-separated title and URL pair.
+.TP
+.I ~/Music/.queue
+Persistent queue state. Saved on exit, restored on launch.
+.TP
+.I ~/Music/.history
+Play history (last 50 entries). Used for recently played on the home screen.
+.PP
+If a track exists in the local library, hum plays the local file
+instead of streaming from YouTube, regardless of what URL the
+playlist or queue entry contains.
 .SH CONFIGURATION
 All configuration is done by editing
 .B config.h
-and rebuilding. This includes:
-.PP
-.RS
-.IP \(bu 2
-All keybinds
-.IP \(bu 2
-All colors (headers, line numbers, playing indicator, visual selection,
-search bar, progress bar, home screen title/subtitle/keys/selection,
-song and playlist markers, and more)
-.IP \(bu 2
-Library path
-.IP \(bu 2
-Search result count (songs and playlists separately)
-.IP \(bu 2
-Volume step and seek step
-.RE
+and rebuilding. This includes all keybinds, all colors, library path,
+search result count (songs and playlists separately),
+volume step, and seek step.
 .PP
 Build options (compiler, flags, install prefix) live in
 .BR config.mk .
