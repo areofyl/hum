@@ -63,6 +63,20 @@ static int input_len;
 static int repeat_mode = REP_OFF;
 static int home_sel;
 
+/* recently played */
+#define MAX_RECENT 5
+static Track recent[MAX_RECENT];
+static int nrecent;
+static char histpath[1024];
+static char queuepath[1024];
+
+/* library filter */
+static char lib_filter[MAX_QUERY];
+static int lib_filter_len;
+static int lib_filtering;
+static int lib_filt[MAX_LIB];
+static int nfilt;
+
 /* visual mode */
 static int visual;
 static int vsel_start;
@@ -185,6 +199,18 @@ lib_has(const char *title)
 			return 1;
 	}
 	return 0;
+}
+
+/* return local path if track is in library, otherwise original url */
+static const char *
+lib_resolve(const char *title, const char *url)
+{
+	int i;
+	for (i = 0; i < nlib; i++) {
+		if (strcmp(library[i].title, title) == 0)
+			return library[i].url;
+	}
+	return url;
 }
 
 static void
@@ -346,6 +372,162 @@ pl_append_tracks(int idx, Track *tracks, int n)
 	fclose(fp);
 }
 
+/* ---- history ---- */
+
+static void
+history_load(void)
+{
+	FILE *fp;
+	char line[MAX_TITLE + MAX_URL];
+	Track tmp[200];
+	int ntmp = 0;
+	int i, j;
+
+	snprintf(histpath, sizeof(histpath), "%s/.history", libpath);
+	fp = fopen(histpath, "r");
+	if (!fp)
+		return;
+	while (fgets(line, sizeof(line), fp) && ntmp < 200) {
+		char *tab = strchr(line, '\t');
+		if (!tab)
+			continue;
+		*tab = '\0';
+		tab++;
+		tab[strcspn(tab, "\n")] = '\0';
+		snprintf(tmp[ntmp].title, MAX_TITLE, "%s", line);
+		snprintf(tmp[ntmp].url, MAX_URL, "%s", tab);
+		ntmp++;
+	}
+	fclose(fp);
+
+	/* walk backwards, collect unique titles */
+	nrecent = 0;
+	for (i = ntmp - 1; i >= 0 && nrecent < MAX_RECENT; i--) {
+		int dup = 0;
+		for (j = 0; j < nrecent; j++) {
+			if (strcmp(recent[j].title, tmp[i].title) == 0) {
+				dup = 1;
+				break;
+			}
+		}
+		if (!dup)
+			recent[nrecent++] = tmp[i];
+	}
+}
+
+static void
+history_log(const char *title, const char *url)
+{
+	FILE *fp;
+
+	fp = fopen(histpath, "a");
+	if (!fp)
+		return;
+	fprintf(fp, "%s\t%s\n", title, url);
+	fclose(fp);
+
+	/* update in-memory recent list: push to front, dedup */
+	int i, j;
+	for (i = 0; i < nrecent; i++) {
+		if (strcmp(recent[i].title, title) == 0) {
+			/* shift down */
+			Track t = recent[i];
+			for (j = i; j > 0; j--)
+				recent[j] = recent[j - 1];
+			recent[0] = t;
+			return;
+		}
+	}
+	/* new entry: shift everything down */
+	if (nrecent < MAX_RECENT)
+		nrecent++;
+	for (j = nrecent - 1; j > 0; j--)
+		recent[j] = recent[j - 1];
+	snprintf(recent[0].title, MAX_TITLE, "%s", title);
+	snprintf(recent[0].url, MAX_URL, "%s", url);
+}
+
+static void
+history_trim(void)
+{
+	FILE *fp;
+	char lines[50][MAX_TITLE + MAX_URL];
+	int nlines = 0, total = 0;
+	char line[MAX_TITLE + MAX_URL];
+
+	fp = fopen(histpath, "r");
+	if (!fp)
+		return;
+	while (fgets(line, sizeof(line), fp))
+		total++;
+	fclose(fp);
+	if (total <= 50)
+		return;
+
+	fp = fopen(histpath, "r");
+	if (!fp)
+		return;
+	int skip = total - 50;
+	int i = 0;
+	while (fgets(line, sizeof(line), fp)) {
+		if (i >= skip && nlines < 50)
+			snprintf(lines[nlines++], sizeof(lines[0]), "%s", line);
+		i++;
+	}
+	fclose(fp);
+
+	fp = fopen(histpath, "w");
+	if (!fp)
+		return;
+	for (i = 0; i < nlines; i++)
+		fputs(lines[i], fp);
+	fclose(fp);
+}
+
+/* ---- persistent queue ---- */
+
+static void
+queue_save(void)
+{
+	FILE *fp;
+	int i;
+
+	fp = fopen(queuepath, "w");
+	if (!fp)
+		return;
+	fprintf(fp, "%d\n", qpos);
+	for (i = 0; i < nqueue; i++)
+		fprintf(fp, "%s\t%s\n", queue[i].title, queue[i].url);
+	fclose(fp);
+}
+
+static void
+queue_load(void)
+{
+	FILE *fp;
+	char line[MAX_TITLE + MAX_URL];
+
+	snprintf(queuepath, sizeof(queuepath), "%s/.queue", libpath);
+	fp = fopen(queuepath, "r");
+	if (!fp)
+		return;
+	if (fgets(line, sizeof(line), fp))
+		qpos = atoi(line);
+	while (fgets(line, sizeof(line), fp) && nqueue < 500) {
+		char *tab = strchr(line, '\t');
+		if (!tab)
+			continue;
+		*tab = '\0';
+		tab++;
+		tab[strcspn(tab, "\n")] = '\0';
+		snprintf(queue[nqueue].title, MAX_TITLE, "%s", line);
+		snprintf(queue[nqueue].url, MAX_URL, "%s", tab);
+		nqueue++;
+	}
+	fclose(fp);
+	if (qpos >= nqueue) qpos = nqueue - 1;
+}
+
 /* ---- mpv ---- */
 
 static int
@@ -433,6 +615,8 @@ mpv_stop(void)
 static void
 mpv_play(const char *url, const char *title)
 {
+	const char *resolved = lib_resolve(title, url);
+
 	mpv_stop();
 	mpv_pid = fork();
 	if (mpv_pid == 0) {
@@ -443,11 +627,12 @@ mpv_play(const char *url, const char *title)
 		snprintf(ipc_arg, sizeof(ipc_arg),
 		    "--input-ipc-server=%s", sock_path);
 		execlp("mpv", "mpv", "--no-video", "--really-quiet",
-		    ipc_arg, url, NULL);
+		    ipc_arg, resolved, NULL);
 		_exit(1);
 	}
 	snprintf(nowplaying, sizeof(nowplaying), "%s", title);
 	paused = 0;
+	history_log(title, url);
 }
 
 static void
@@ -816,11 +1001,12 @@ static void
 play_selected(void)
 {
 	if (mode == MODE_LIBRARY) {
-		if (sel < 0 || sel >= nlib)
+		if (sel < 0 || sel >= nfilt)
 			return;
-		queue_add(&library[sel]);
+		int idx = lib_filt[sel];
+		queue_add(&library[idx]);
 		qpos = nqueue - 1;
-		mpv_play(library[sel].url, library[sel].title);
+		mpv_play(library[idx].url, library[idx].title);
 		return;
 	}
 	if (mode == MODE_QUEUE) {
@@ -858,6 +1044,7 @@ play_selected(void)
 static void
 cleanup(void)
 {
+	queue_save();
 	search_cancel();
 	mpv_stop();
 	endwin();
@@ -890,7 +1077,7 @@ static int
 list_len(void)
 {
 	if (mode == MODE_QUEUE) return nqueue;
-	if (mode == MODE_LIBRARY) return nlib;
+	if (mode == MODE_LIBRARY) return nfilt;
 	if (mode == MODE_PLAYLIST)
 		return pl_level == 0 ? nplaylists : npl_tracks;
 	if (mode == MODE_PLADD) return nplaylists;
@@ -927,33 +1114,72 @@ draw(void)
 	if (visible < 1) visible = 1;
 
 	if (mode == MODE_HOME) {
-		int cy = rows / 2 - 5;
-		if (cy < 1) cy = 1;
-		int mx = (cols - 24) / 2;
-		if (mx < 2) mx = 2;
-		int mw = 24;
+		static const char *logo[] = {
+			"   ____ ___  ____ ___  ________ ",
+			"  /    /   \\/    /   \\/        \\",
+			" /         /         /         /",
+			"/         /         /   /  /  / ",
+			"\\___/____/\\________/\\__/__/__/  ",
+		};
+		int logo_w = 32;
+		int logo_h = 5;
+		int mw = 36;
+		if (mw > cols - 4) mw = cols - 4;
+		int mx = (cols - mw) / 2;
+		if (mx < 1) mx = 1;
+		int cy = rows / 2 - 7;
+		if (cy < 0) cy = 0;
+		int lx = mx + (mw - logo_w) / 2;
+		if (lx < 0) lx = 0;
 
+		int i;
 		attron(A_BOLD | COLOR_PAIR(C_HTITLE));
-		mvprintw(cy, (cols - 3) / 2, "hum");
+		for (i = 0; i < logo_h; i++)
+			mvprintw(cy + i, lx, "%s", logo[i]);
 		attroff(A_BOLD | COLOR_PAIR(C_HTITLE));
 
 		attron(COLOR_PAIR(C_HSUB));
-		mvprintw(cy + 1, (cols - 10) / 2, "by areofyl");
+		mvprintw(cy + logo_h + 1, mx + (mw - 10) / 2, "by areofyl");
 		attroff(COLOR_PAIR(C_HSUB));
+
+		int my = cy + logo_h + 3;
 
 		static const char keys[]    = { 'p', 'b', '/', 'v' };
 		static const char *labels[] = {
 			"playlists", "browse library",
 			"search youtube", "queue",
 		};
+		int counts[] = { nplaylists, nlib, -1, nqueue };
+		char countbuf[16];
 
-		int i;
 		for (i = 0; i < 4; i++) {
-			int y = cy + 4 + i * 2;
-			mvprintw(y, mx, " ");
+			int y = my + i;
+			/* format count string */
+			if (counts[i] > 999)
+				snprintf(countbuf, sizeof(countbuf), "1000+");
+			else if (counts[i] >= 0)
+				snprintf(countbuf, sizeof(countbuf), "%d", counts[i]);
+			else
+				countbuf[0] = '\0';
+
+			int clen = (int)strlen(countbuf);
+			/* total row: "  k    label   count  " = mw chars */
+			int inner = mw - 9; /* space after key to before trailing "  " */
+			int label_max = clen > 0 ? inner - clen - 1 : inner;
+			if (label_max < 1) label_max = 1;
+			int llen = (int)strlen(labels[i]);
+			int trunc = llen > label_max;
+
+			move(y, mx);
 			if (sel == i) {
 				attron(A_BOLD | COLOR_PAIR(C_HSEL));
-				printw("  %c    %-*s", keys[i], mw - 7, labels[i]);
+				printw("  %c    ", keys[i]);
+				if (trunc)
+					printw("%.*s..", label_max - 2, labels[i]);
+				else
+					printw("%-*s", label_max, labels[i]);
+				if (clen > 0) printw(" %*s", clen, countbuf);
+				printw("  ");
 				attroff(A_BOLD | COLOR_PAIR(C_HSEL));
 			} else {
 				printw("  ");
@@ -961,19 +1187,59 @@ draw(void)
 				printw("%c", keys[i]);
 				attroff(A_BOLD | COLOR_PAIR(C_HKEY));
 				printw("    ");
-				printw("%-*s", mw - 7, labels[i]);
+				if (trunc)
+					printw("%.*s..", label_max - 2, labels[i]);
+				else
+					printw("%-*s", label_max, labels[i]);
+				if (clen > 0) {
+					attron(COLOR_PAIR(C_HSUB));
+					printw(" %*s", clen, countbuf);
+					attroff(COLOR_PAIR(C_HSUB));
+				}
+				printw("  ");
 			}
 		}
 
-		mvprintw(cy + 13, mx, "  ");
+		if (nrecent > 0) {
+			int ry = my + 5;
+			int tw = mw - 6; /* title width after "  1  " */
+			if (tw < 4) tw = 4;
+			attron(A_BOLD | COLOR_PAIR(C_HEADER));
+			mvprintw(ry, mx, "  recently played");
+			attroff(A_BOLD | COLOR_PAIR(C_HEADER));
+			ry++;
+			for (i = 0; i < nrecent; i++) {
+				int ridx = 4 + i;
+				int playing = (nowplaying[0] &&
+				    strcmp(recent[i].title, nowplaying) == 0);
+				int tlen = (int)strlen(recent[i].title);
+				mvprintw(ry + i, mx, "  ");
+				attron(COLOR_PAIR(playing ? C_PLAYING : C_NUM));
+				printw("%d", i + 1);
+				attroff(COLOR_PAIR(playing ? C_PLAYING : C_NUM));
+				printw("  ");
+				if (sel == ridx) attron(A_BOLD | COLOR_PAIR(C_HSEL));
+				if (tlen > tw)
+					printw("%.*s..", tw - 2, recent[i].title);
+				else
+					printw("%-*s", tw, recent[i].title);
+				if (sel == ridx) attroff(A_BOLD | COLOR_PAIR(C_HSEL));
+			}
+		}
+
+		int fy = my + 5 + (nrecent > 0 ? nrecent + 2 : 1);
+		mvprintw(fy, mx, "  ");
 		attron(A_BOLD | COLOR_PAIR(C_HKEY));
 		printw("?");
 		attroff(A_BOLD | COLOR_PAIR(C_HKEY));
-		printw("  help    ");
+		printw("  help");
+		/* right-justify "q  quit" */
+		int qx = mx + mw - 8;
+		move(fy, qx);
 		attron(A_BOLD | COLOR_PAIR(C_HKEY));
 		printw("q");
 		attroff(A_BOLD | COLOR_PAIR(C_HKEY));
-		printw("  quit");
+		printw("  quit  ");
 
 	} else if (mode == MODE_HELP) {
 		int y = 0;
@@ -1058,18 +1324,61 @@ draw(void)
 			mvprintw(2, 0, " empty");
 
 	} else if (mode == MODE_LIBRARY) {
+		/* build filtered index */
+		nfilt = 0;
+		if (lib_filtering && lib_filter_len > 0) {
+			int li;
+			for (li = 0; li < nlib; li++) {
+				/* case-insensitive substring match */
+				const char *t = library[li].title;
+				const char *f = lib_filter;
+				int ti, fi, match = 0;
+				for (ti = 0; t[ti] && !match; ti++) {
+					for (fi = 0; f[fi]; fi++) {
+						char tc = t[ti + fi];
+						char fc = f[fi];
+						if (tc >= 'A' && tc <= 'Z') tc += 32;
+						if (fc >= 'A' && fc <= 'Z') fc += 32;
+						if (tc != fc) break;
+					}
+					if (!f[fi]) match = 1;
+				}
+				if (match) lib_filt[nfilt++] = li;
+			}
+		} else {
+			int li;
+			for (li = 0; li < nlib; li++)
+				lib_filt[nfilt++] = li;
+		}
+
 		attron(A_BOLD | COLOR_PAIR(C_HEADER));
-		mvprintw(0, 0, " library (%d tracks)", nlib);
+		if (lib_filtering)
+			mvprintw(0, 0, " library (%d/%d)", nfilt, nlib);
+		else
+			mvprintw(0, 0, " library (%d tracks)", nlib);
 		attroff(A_BOLD | COLOR_PAIR(C_HEADER));
 
-		for (i = 0; i < visible && i + libscroll < nlib; i++) {
-			int idx = i + libscroll;
-			int selected = (idx == sel || in_vsel(idx));
+		if (lib_filtering) {
+			attron(A_BOLD | COLOR_PAIR(C_SEARCH));
+			mvprintw(1, 0, " /");
+			attroff(A_BOLD | COLOR_PAIR(C_SEARCH));
+			printw(" %s_", lib_filter);
+		}
+
+		int loff = lib_filtering ? 3 : 2;
+		int lvis = rows - loff - 3;
+		if (lvis < 1) lvis = 1;
+		if (sel >= nfilt) sel = nfilt > 0 ? nfilt - 1 : 0;
+
+		for (i = 0; i < lvis && i + libscroll < nfilt; i++) {
+			int fidx = i + libscroll;
+			int idx = lib_filt[fidx];
+			int selected = (fidx == sel || (visual && fidx >= vsel_min() && fidx <= vsel_max()));
 			int playing = (nowplaying[0] &&
 			    strcmp(library[idx].title, nowplaying) == 0);
-			mvprintw(i + 2, 0, " ");
+			mvprintw(i + loff, 0, " ");
 			attron(COLOR_PAIR(playing ? C_PLAYING : C_NUM));
-			printw("%2d", idx + 1);
+			printw("%2d", fidx + 1);
 			attroff(COLOR_PAIR(playing ? C_PLAYING : C_NUM));
 			printw("  ");
 			if (selected && visual) attron(COLOR_PAIR(C_VISUAL));
@@ -1078,8 +1387,10 @@ draw(void)
 			if (selected && visual) attroff(COLOR_PAIR(C_VISUAL));
 			else if (selected) attroff(A_REVERSE);
 		}
-		if (nlib == 0)
-			mvprintw(2, 0, " no tracks - play songs to build your library");
+		if (nfilt == 0 && lib_filtering)
+			mvprintw(loff, 0, " no matches");
+		else if (nlib == 0)
+			mvprintw(loff, 0, " no tracks - play songs to build your library");
 
 	} else if (mode == MODE_PLAYLIST) {
 		if (pl_level == 0) {
@@ -1405,6 +1716,7 @@ main(int argc, char *argv[])
 	ensure_dir(plspath);
 
 	initscr();
+	set_escdelay(25);
 	cbreak();
 	noecho();
 	keypad(stdscr, TRUE);
@@ -1434,6 +1746,10 @@ main(int argc, char *argv[])
 	atexit(cleanup);
 
 	pl_scan();
+	lib_scan();
+	history_load();
+	history_trim();
+	queue_load();
 	mode = start_mode;
 	sel = 0;
 	if (mode == MODE_LIBRARY) {
@@ -1586,10 +1902,11 @@ main(int argc, char *argv[])
 		if (mode == MODE_HOME) {
 			int handled = 1;
 			int old_sel = sel;
+			int home_max = 3 + (nrecent > 0 ? nrecent : 0);
 			if (ch == key_up || ch == KEY_UP) {
 				if (sel > 0) sel--;
 			} else if (ch == key_down || ch == KEY_DOWN) {
-				if (sel < 3) sel++;
+				if (sel < home_max) sel++;
 			} else if (ch == '\n' || ch == KEY_ENTER || ch == 'l') {
 				if (sel == 0) {
 					mode = MODE_PLAYLIST;
@@ -1610,22 +1927,22 @@ main(int argc, char *argv[])
 					mode = MODE_QUEUE;
 					sel = qpos >= 0 ? qpos : 0;
 					qscroll = 0;
+				} else if (sel >= 4 && sel < 4 + nrecent) {
+					int ri = sel - 4;
+					queue_add(&recent[ri]);
+					qpos = nqueue - 1;
+					mpv_play(recent[ri].url, recent[ri].title);
 				}
-			} else if (ch == '/' || ch == 27) {
-				int next = (ch == 27) ? getch() : '/';
-				if (next == '/') {
-					mode = MODE_SEARCH;
-					qlen = 0;
-					query[0] = '\0';
-				} else if (next == 'p') {
-					mode = MODE_PLAYLIST;
-					pl_scan();
-					pl_level = 0;
-					sel = 0;
-					plscroll = 0;
-				} else if (next != ERR) {
-					ungetch(next);
-				}
+			} else if (ch == '/') {
+				mode = MODE_SEARCH;
+				qlen = 0;
+				query[0] = '\0';
+			} else if (ch == 'p') {
+				mode = MODE_PLAYLIST;
+				pl_scan();
+				pl_level = 0;
+				sel = 0;
+				plscroll = 0;
 			} else if (ch == key_lib) {
 				mode = MODE_LIBRARY;
 				lib_scan();
@@ -2006,25 +2323,50 @@ main(int argc, char *argv[])
 			}
 
 		} else if (mode == MODE_LIBRARY) {
-			if (ch == '\n' || ch == KEY_ENTER || ch == key_play) {
+			if (lib_filtering) {
+				int r = handle_text_input(ch, lib_filter,
+				    &lib_filter_len, MAX_QUERY);
+				if (r == 1 || r == -1) {
+					if (r == -1) {
+						lib_filter_len = 0;
+						lib_filter[0] = '\0';
+					}
+					lib_filtering = 0;
+					sel = 0;
+					libscroll = 0;
+				} else {
+					sel = 0;
+					libscroll = 0;
+				}
+				draw();
+				continue;
+			}
+			if (ch == '/') {
+				lib_filtering = 1;
+				lib_filter_len = 0;
+				lib_filter[0] = '\0';
+				sel = 0;
+				libscroll = 0;
+			} else if (ch == '\n' || ch == KEY_ENTER || ch == key_play) {
 				play_selected();
 				visual = 0;
 			} else if (ch == key_queue) {
 				if (visual) {
 					int lo = vsel_min(), hi = vsel_max(), j;
-					for (j = lo; j <= hi && j < nlib; j++)
-						queue_add(&library[j]);
+					for (j = lo; j <= hi && j < nfilt; j++)
+						queue_add(&library[lib_filt[j]]);
 					status_set("added to queue");
 					visual = 0;
-				} else if (sel >= 0 && sel < nlib) {
-					queue_add(&library[sel]);
+				} else if (sel >= 0 && sel < nfilt) {
+					queue_add(&library[lib_filt[sel]]);
 					status_set("added to queue");
 				}
 			} else if (ch == key_del) {
-				if (sel >= 0 && sel < nlib) {
+				if (sel >= 0 && sel < nfilt) {
+					int idx = lib_filt[sel];
 					snprintf(confirm_msg, sizeof(confirm_msg),
-					    "delete '%s' from library?", library[sel].title);
-					confirm_arg = sel;
+					    "delete '%s' from library?", library[idx].title);
+					confirm_arg = idx;
 					confirm_action = do_lib_delete;
 					confirm_ret = MODE_LIBRARY;
 					mode = MODE_CONFIRM;
@@ -2034,11 +2376,11 @@ main(int argc, char *argv[])
 					if (visual) {
 						int lo = vsel_min(), hi = vsel_max(), j;
 						npladd = 0;
-						for (j = lo; j <= hi && j < nlib; j++)
-							pladd_tracks[npladd++] = library[j];
-					} else if (sel >= 0 && sel < nlib) {
+						for (j = lo; j <= hi && j < nfilt; j++)
+							pladd_tracks[npladd++] = library[lib_filt[j]];
+					} else if (sel >= 0 && sel < nfilt) {
 						npladd = 1;
-						pladd_tracks[0] = library[sel];
+						pladd_tracks[0] = library[lib_filt[sel]];
 					}
 					if (npladd > 0) {
 						pl_scan();
@@ -2049,6 +2391,9 @@ main(int argc, char *argv[])
 					}
 				}
 			} else if (ch == key_quit || ch == 27) {
+				lib_filtering = 0;
+				lib_filter_len = 0;
+				lib_filter[0] = '\0';
 				mode = MODE_HOME;
 				sel = home_sel;
 				visual = 0;
